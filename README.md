@@ -13,6 +13,6 @@ UOEP是一个可广泛用于明日方舟干员、随着游戏更新不断发展�
 ---
 <div style="font-size: smaller; color: gray">
 
-本项目的数据和文档采用知识共享署名—非商业性使用—相同方式共享4.0协议[<sup>1</sup>](https://creativecommons.org/licenses/by-nc-sa/4.0/)授权，源代码采用GNU GPLv3协议[<sup>2</sup>](https://www.gnu.org/licenses/gpl-3.0.en.html)授权。
+本项目的数据和文档采用知识共享署名—非商业性使用—相同方式共享4.0协议<sup><a href="https://creativecommons.org/licenses/by-nc-sa/4.0/">1</a></sup>授权，源代码采用GNU GPLv3协议<sup><a href="https://www.gnu.org/licenses/gpl-3.0.en.html">2</a></sup>授权。
 
 </div>
