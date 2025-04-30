@@ -1,4 +1,4 @@
-# 泛用型环境自适应干员强度评价体系 (Universal battlefield-adaptive Operator Evaluation Protocol)
+# 泛用型环境自适应干员强度评价体系
 
 <img src="resources/logo-light-with-title.webp" alt="UOEP Logo" width="350" height="auto" >
 
