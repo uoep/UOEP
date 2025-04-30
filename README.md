@@ -1,4 +1,4 @@
-# 泛用型环境自适应干员强度评价体系 (Universal battlefield-adaptive Operator Evaluation Protocol, UOEP)
+# 泛用型环境自适应干员强度评价体系 (Universal battlefield-adaptive Operator Evaluation Protocol)
 
 <img src="resources/logo-light-with-title.png" alt="UOEP Logo" width="350" height="auto" >
 
@@ -13,6 +13,6 @@ UOEP是一个可广泛用于明日方舟干员、随着游戏更新不断发展�
 ---
 <div style="font-size: smaller; color: gray">
 
-本项目的数据和文档采用知识共享署名—非商业性使用—相同方式共享4.0协议<sup>[1](https://creativecommons.org/licenses/by-nc-sa/4.0/)</sup>授权，源代码采用GNU GPLv3协议<sup>[2](https://www.gnu.org/licenses/gpl-3.0.en.html)</sup>授权。
+本项目的数据和文档采用知识共享署名—非商业性使用—相同方式共享4.0协议[<sup>1</sup>](https://creativecommons.org/licenses/by-nc-sa/4.0/)授权，源代码采用GNU GPLv3协议[<sup>2</sup>](https://www.gnu.org/licenses/gpl-3.0.en.html)授权。
 
 </div>
