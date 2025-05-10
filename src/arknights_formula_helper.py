@@ -195,7 +195,9 @@ class Engine:
                 TrueDamageBuffInjector(),
                 ElementalDamageBuffInjector(),
                 DefaultElementalDamageBuffInjector(),
-                InjuryBuffInjector(),
+                DirectInjuryBuffInjector(),
+                PhysicalInjuryBuffInjector(),
+                MagicalInjuryBuffInjector(),
                 AutomaticSkillBuffInjector(),
                 OffensiveSkillAttackCountInjector(),
                 OffensiveSkillInjector(),
@@ -812,6 +814,7 @@ class PlainPosition(Enum):
 
 class OperatorElementalType(Enum):
     NONE = "None"
+    SANITY = "Sanity"
     FIRE = "Fire"
     DARK = "Dark"
 
@@ -869,6 +872,7 @@ class OperatorInfo:
     def _parse_elemental_type(self, elemental_type: str) -> OperatorElementalType:
         elemental_type_map = {
             "": OperatorElementalType.NONE,
+            "神经": OperatorElementalType.SANITY,
             "灼燃": OperatorElementalType.FIRE,
             "凋亡": OperatorElementalType.DARK,
         }
@@ -879,14 +883,14 @@ class OperatorInfo:
         return elemental_type_map[elemental_type]
 
     def _parse_has_summon(self, summon_attack: str) -> bool:
-        # summon_attack must be "", "#N/A", or a positive integer
+        # summon_attack must be "", "#N/A", or a positive number
         if summon_attack == "":
             return False
         elif summon_attack == "#N/A":
             return True
         else:
             try:
-                int(summon_attack)
+                float(summon_attack)
             except ValueError:
                 raise
             return True
@@ -1014,6 +1018,9 @@ class Operator(DeployableUnit):
     def deal_elemental(self) -> bool:
         return Operator._info[self._id].elemental_type != OperatorElementalType.NONE
 
+    def deal_elemental_sanity(self) -> bool:
+        return Operator._info[self._id].elemental_type == OperatorElementalType.SANITY
+
     def deal_elemental_fire(self) -> bool:
         return Operator._info[self._id].elemental_type == OperatorElementalType.FIRE
 
@@ -1135,7 +1142,9 @@ class OperatorElementalDamageValidator(Visitor):
             patterns = [
                 re.compile(_elemental_damage_regex, re.M | re.X),
                 re.compile(_default_elemental_damage_regex, re.M | re.X),
-                re.compile(_injury_regex, re.M | re.X),
+                re.compile(_direct_injury_regex, re.M | re.X),
+                re.compile(_physical_injury_regex, re.M | re.X),
+                re.compile(_magical_injury_regex, re.M | re.X),
             ]
             for pattern in patterns:
                 matches = re.findall(pattern, formula)
@@ -1160,8 +1169,9 @@ class AnnotationValidator(Visitor):
                 "@MonoEnemyVulnerable", "@MonoEnemyVulnerablePhysical",
                 "@MonoEnemyVulnerableMagical", "@MonoEnemyVulnerableElemental",
                 "@MonoSkillPointAutomatic",
-                "@True", "@InjuryFire", "@InjuryDark", "@SkillOffensiveAttackCount",
-                "@AttackSpeed", "@SkillAutomatic", "@SkillOffensive",
+                "@True", "@InjurySanity", "@InjuryFire", "@InjuryDark",
+                "@SkillOffensiveAttackCount", "@AttackSpeed", "@SkillAutomatic",
+                "@SkillOffensive",
             ])
         elif self._transform_mode.from_endurance():
             self._ensure_legal(formula, legal_annotations=[
@@ -1280,19 +1290,25 @@ class Transformer:
             "only one kind of elemental damage"
         )
         has_elemental = False
+        sanity = False
         fire = False
         dark = False
         for operator in operators:
             if operator.deal_elemental():
                 has_elemental = True
-            if operator.deal_elemental_fire():
-                Assert.true(not dark, error_message)
+            if operator.deal_elemental_sanity():
+                Assert.true((not fire) and (not dark), error_message)
+                sanity = True
+            elif operator.deal_elemental_fire():
+                Assert.true((not sanity) and (not dark), error_message)
                 fire = True
             elif operator.deal_elemental_dark():
-                Assert.true(not fire, error_message)
+                Assert.true((not sanity) and (not fire), error_message)
                 dark = True
         if has_elemental:
-            if fire:
+            if sanity:
+                return OperatorElementalType.SANITY
+            elif fire:
                 return OperatorElementalType.FIRE
             elif dark:
                 return OperatorElementalType.DARK
@@ -1536,7 +1552,9 @@ class DamageBuffInjector(BuffInjector):
                 "Expect operator to deal elemental damage"
             )
             mono_buff = "BuffDamageMonoEnemyVulnerableElementalFinalRatio"
-            if elemental_type == OperatorElementalType.FIRE:
+            if elemental_type == OperatorElementalType.SANITY:
+                mono_buff += ",BuffDamageMonoEnemyVulnerableElementalFinalRatioSanity"
+            elif elemental_type == OperatorElementalType.FIRE:
                 mono_buff += ",BuffDamageMonoEnemyVulnerableElementalFinalRatioFire"
             elif elemental_type == OperatorElementalType.DARK:
                 mono_buff += ",BuffDamageMonoEnemyVulnerableElementalFinalRatioDark"
@@ -1781,6 +1799,7 @@ class DefaultElementalDamageBuffInjector(DamageBuffInjector):
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
+            self._get_attack_gain_pass(damage_type="elemental"),
             self._get_attack_final_ratio_pass(damage_type="elemental"),
         ]
 
@@ -1788,11 +1807,12 @@ class DefaultElementalDamageBuffInjector(DamageBuffInjector):
     def _ensure_valid(self, match: re.Match) -> None:
         groups = match.groupdict()
         Assert.has_key(groups, [
-            "default_elemental_main", "default_dark", "default_fire",
-            "damage_final_ratio", "damage_final_ratio_empty",
+            "default_elemental_main", "default_sanity", "default_fire", "default_dark",
+            "attack_gain", "damage_final_ratio", "damage_final_ratio_empty",
         ])
+        Assert.not_none(groups, ["attack_gain"])
         Assert.not_empty(groups, ["default_elemental_main"])
-        Assert.either(groups, ["default_dark", "default_fire"])
+        Assert.either(groups, ["default_sanity", "default_fire", "default_dark"])
         Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
 
 
@@ -1800,9 +1820,32 @@ class InjuryBuffInjector(DamageBuffInjector):
     def __init__(self):
         super().__init__()
 
+    def _inject_injury_final_ratio(self, context: MatchContext) -> None:
+        injury_buffs = {
+            '@InjurySanity': '*BuffDamageInjuryFinalRatio*BuffDamageInjurySanityFinalRatio',
+            '@InjuryFire': '*BuffDamageInjuryFinalRatio*BuffDamageInjuryFireFinalRatio',
+            '@InjuryDark': '*BuffDamageInjuryFinalRatio*BuffDamageInjuryDarkFinalRatio',
+        }
+        injury_type = context.match.group("injury_type")
+        Assert.true(
+            injury_type in injury_buffs, f"Unrecognized injury_type `{injury_type}`"
+        )
+        buff = injury_buffs[injury_type]
+        if context.match.group("injury_final_ratio") is not None:
+            context.insert(buff, after="injury_final_ratio")
+        elif context.match.group("injury_final_ratio_empty") is not None:
+            context.insert(f'*(1{buff})', after="injury_final_ratio_empty")
+        else:
+            Assert.never()
+
+
+class DirectInjuryBuffInjector(InjuryBuffInjector):
+    def __init__(self):
+        super().__init__()
+
     @Assert.override(Transformer)
     def _get_pattern(self) -> re.Pattern:
-        return re.compile(_injury_regex, re.M | re.X)
+        return re.compile(_direct_injury_regex, re.M | re.X)
 
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
@@ -1810,9 +1853,111 @@ class InjuryBuffInjector(DamageBuffInjector):
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
-            self._inject_attack_gain_if_magical,
-            self._get_damage_weakener_pass(damage_type="magical", allow_empty=True),
-            self._get_attack_final_ratio_pass(damage_type="magical", allow_empty=True),
+            self._inject_injury_final_ratio,
+        ]
+
+    @Assert.override(Transformer)
+    def _ensure_valid(self, match: re.Match) -> None:
+        groups = match.groupdict()
+        Assert.has_key(groups, [
+            "injury_main", "injury_type", "id", "attack_first_value",
+            "attack_first_ratio", "attack_first_ratio_empty",
+            "attack_final_value", "attack_multiplier", "attack_gain",
+            "injury_final_ratio", "injury_final_ratio_empty",
+        ])
+        Assert.not_none(groups, [
+            "attack_first_value", "attack_final_value",
+            "attack_multiplier", "attack_gain",
+        ])
+        Assert.not_empty(groups, ["injury_main", "injury_type", "id"])
+        Assert.either(groups, ["attack_first_ratio", "attack_first_ratio_empty"])
+        Assert.either(groups, ["injury_final_ratio", "injury_final_ratio_empty"])
+
+
+class PhysicalInjuryBuffInjector(InjuryBuffInjector):
+    def __init__(self):
+        super().__init__()
+
+    @Assert.override(Transformer)
+    def _get_pattern(self) -> re.Pattern:
+        return re.compile(_physical_injury_regex, re.M | re.X)
+
+    @Assert.override(Transformer)
+    def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
+        return [
+            self._inject_attack_first_value,
+            self._inject_attack_first_ratio,
+            self._inject_attack_final_value,
+            self._get_attack_gain_pass(damage_type="physical"),
+            self._get_damage_weakener_pass(damage_type="physical"),
+            self._get_attack_final_ratio_pass(damage_type="physical"),
+            self._inject_injury_final_ratio,
+        ]
+
+    @Assert.override(Transformer)
+    def _ensure_valid(self, match: re.Match) -> None:
+        groups = match.groupdict()
+        Assert.has_key(groups, [
+            "physical_line_1", "injury_type",
+            "id", "attack_first_value", "attack_first_ratio",
+            "attack_first_ratio_empty", "attack_final_value", "attack_multiplier",
+            "attack_gain", "physical_line_2", "defense_loss_value",
+            "defense_loss_value_ungrouped", "defense_loss_value_empty",
+            "defense_loss_ratio", "defense_ignore_value",
+            "defense_ignore_value_ungrouped", "defense_ignore_value_empty",
+            "defense_ignore_ratio", "defense_ungrouped",
+            "damage_final_ratio", "damage_final_ratio_empty",
+            "physical_injury_multiplier",
+            "injury_final_ratio", "injury_final_ratio_empty",
+        ])
+        Assert.not_none(groups, [
+            "attack_first_value", "attack_final_value", 
+            "attack_multiplier", "attack_gain",
+            "physical_injury_multiplier",
+        ])
+        Assert.not_empty(groups, [
+            "physical_line_1", "physical_line_2", "injury_type", "id",
+        ])
+        Assert.equal(groups, "physical_line_1", "physical_line_2")
+        Assert.either(groups, ["attack_first_ratio", "attack_first_ratio_empty"])
+        Assert.true(
+            (
+                Check.not_none(groups, "defense_ungrouped")
+            ) or (
+                Check.either(groups, [
+                    "defense_loss_value",
+                    "defense_loss_value_ungrouped",
+                    "defense_loss_value_empty",
+                ]) and
+                Check.not_none(groups, "defense_loss_ratio") and
+                Check.either(groups, [
+                    "defense_ignore_value",
+                    "defense_ignore_value_ungrouped",
+                    "defense_ignore_value_empty",
+                ]) and
+                Check.not_none(groups, "defense_ignore_ratio")
+            ), error_message="Sanity check failed", groups=groups)
+        Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
+        Assert.either(groups, ["injury_final_ratio", "injury_final_ratio_empty"])
+
+
+class MagicalInjuryBuffInjector(InjuryBuffInjector):
+    def __init__(self):
+        super().__init__()
+
+    @Assert.override(Transformer)
+    def _get_pattern(self) -> re.Pattern:
+        return re.compile(_magical_injury_regex, re.M | re.X)
+
+    @Assert.override(Transformer)
+    def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
+        return [
+            self._inject_attack_first_value,
+            self._inject_attack_first_ratio,
+            self._inject_attack_final_value,
+            self._get_attack_gain_pass(damage_type="magical"),
+            self._get_damage_weakener_pass(damage_type="magical"),
+            self._get_attack_final_ratio_pass(damage_type="magical"),
             self._inject_injury_final_ratio,
         ]
 
@@ -1827,66 +1972,35 @@ class InjuryBuffInjector(DamageBuffInjector):
             "resist_loss_ratio", "resist_ignore_value", "resist_ignore_value_ungrouped",
             "resist_ignore_value_empty", "resist_ignore_ratio", "resist_ungrouped",
             "damage_final_ratio", "damage_final_ratio_empty",
-            "magical_injury_multiplier", "resist_empty", "injury_final_ratio",
-            "injury_final_ratio_empty",
+            "magical_injury_multiplier", 
+            "injury_final_ratio", "injury_final_ratio_empty",
         ])
         Assert.not_none(groups, [
             "attack_first_value", "attack_final_value",
-            "attack_multiplier", "attack_gain"
+            "attack_multiplier", "attack_gain",
+            "magical_injury_multiplier",
         ])
         Assert.not_empty(groups, ["injury_main", "injury_type", "id"])
         Assert.either(groups, ["attack_first_ratio", "attack_first_ratio_empty"])
         Assert.true(
             (
-                (
-                    (
-                        Check.not_none(groups, "resist_loss_ratio") and
-                        Check.either(groups, [
-                            "resist_loss_value",
-                            "resist_loss_value_ungrouped",
-                            "resist_loss_value_empty"
-                        ]) and
-                        Check.either(groups, [
-                            "resist_ignore_value",
-                            "resist_ignore_value_ungrouped",
-                            "resist_ignore_value_empty",
-                        ]) and
-                        Check.not_none(groups, "resist_ignore_ratio")
-                    ) or (
-                        Check.not_none(groups, "resist_ungrouped")
-                    )
-                ) and (
-                    Check.either(groups, [
-                        "damage_final_ratio",
-                        "damage_final_ratio_empty",
-                    ]) and
-                    Check.not_none(groups, "magical_injury_multiplier")
-                )
+                Check.not_none(groups, "resist_loss_ratio") and
+                Check.either(groups, [
+                    "resist_loss_value",
+                    "resist_loss_value_ungrouped",
+                    "resist_loss_value_empty"
+                ]) and
+                Check.either(groups, [
+                    "resist_ignore_value",
+                    "resist_ignore_value_ungrouped",
+                    "resist_ignore_value_empty",
+                ]) and
+                Check.not_none(groups, "resist_ignore_ratio")
             ) or (
-                Check.not_none(groups, "resist_empty")
+                Check.not_none(groups, "resist_ungrouped")
             ), error_message="Sanity check failed", groups=groups)
+        Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
         Assert.either(groups, ["injury_final_ratio", "injury_final_ratio_empty"])
-
-    def _inject_attack_gain_if_magical(self, context: MatchContext) -> None:
-        if context.match.group("resist_empty") is None:  # has magical resistance
-            self._get_attack_gain_pass(damage_type="magical")(context)
-
-    def _inject_injury_final_ratio(self, context: MatchContext) -> None:
-        injury_buffs = {
-            '@InjuryDark': '*BuffDamageInjuryFinalRatio*BuffDamageInjuryDarkFinalRatio',
-            '@InjuryFire': '*BuffDamageInjuryFinalRatio*BuffDamageInjuryFireFinalRatio',
-        }
-        injury_type = context.match.group("injury_type")
-        Assert.true(
-            injury_type in injury_buffs, f"Unrecognized injury_type `{injury_type}`"
-        )
-        buff = injury_buffs[injury_type]
-        if context.match.group("injury_final_ratio") is not None:
-            context.insert(buff, after="injury_final_ratio")
-        elif context.match.group("injury_final_ratio_empty") is not None:
-            context.insert(f'*(1{buff})', after="injury_final_ratio_empty")
-        else:
-            Assert.never()
 
 
 class AttackSpeedBuffInjector(BuffInjector):
@@ -2927,6 +3041,7 @@ class Minifier(WholeTransformer):
         "BuffDamageTrueFinalRatio": "zw",
         "BuffDamageElementalFinalRatio": "zx",
         "BuffDamageInjuryFinalRatio": "zy",
+        "BuffDamageInjurySanityFinalRatio": "zbi",
         "BuffDamageInjuryFireFinalRatio": "zz",
         "BuffDamageInjuryDarkFinalRatio": "zaa",
         "BuffDamageSkillPointValueAutomatic": "zab",
@@ -2956,12 +3071,13 @@ class Minifier(WholeTransformer):
         "BuffDamageMonoEnemyVulnerablePhysicalFinalRatio": "zbh",
         "BuffDamageMonoEnemyVulnerableMagicalFinalRatio": "zaz",
         "BuffDamageMonoEnemyVulnerableElementalFinalRatio": "zba",
+        "BuffDamageMonoEnemyVulnerableElementalFinalRatioSanity": "zbj",
         "BuffDamageMonoEnemyVulnerableElementalFinalRatioFire": "zbf",
         "BuffDamageMonoEnemyVulnerableElementalFinalRatioDark": "zbg",
         "BuffDamageMonoSkillPointValueAutomatic": "zbc",
         "BuffDamageMonoSkillPointValueAutomaticCaster": "zbd",
         "BuffDamageMonoSkillPointValueAutomaticSupporter": "zbe",
-        # last variable abbreviation: zbh
+        # last variable abbreviation: zbj
 
         "EnemyDefenseMajor": "zua",
         "EnemyDefenseMinor": "zub",
@@ -3251,11 +3367,16 @@ _elemental_damage_regex = r"""
 
 _default_elemental_damage_regex = r"""
 (?P<default_elemental_main>
-  \(\s*(?:
-    (?P<default_dark>800)
-    |
-    (?P<default_fire>7000)
-  )\s*\)
+  \(\s*
+    (?:
+      (?P<default_dark>800)
+      |
+      (?P<default_fire>7000)
+      |
+      (?P<default_sanity>6000)
+    )
+    (?P<attack_gain>)
+  \s*\)
 )
 \*\(\s*MEDIAN
   \(\s*100-(?:EnemyElementalResistanceMajor|EnemyElementalResistanceMinor),\s*0,\s*100
@@ -3273,12 +3394,157 @@ _default_elemental_damage_regex = r"""
 )
 """
 
-_injury_regex = r"""
+_direct_injury_regex = r"""
 (?P<injury_main>
   \(\s*
     \(\s*
       \(\s*
-        N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire))"\s*\)\+
+        N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
+        (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
+        (?P<attack_first_value>(?:\+[0-9]+)*)
+      \s*\)
+      (?:
+        \*\(\s*1(?P<attack_first_ratio>(?:
+          [+*/][0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
+        )*)\s*\)
+        |
+        (?P<attack_first_ratio_empty>)
+      )
+      (?P<attack_final_value>(?:
+        \+[0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
+      )*)
+    \s*\)
+    (?P<attack_multiplier>(?:\*[0-9.]+)*)
+    (?P<attack_gain>(?:\+[0-9.]+)*)
+  \s*\)
+)
+\*\(\s*MEDIAN
+  \(\s*
+    100-(?:EnemyInjuryResistanceMajor|EnemyInjuryResistanceMinor),\s*
+    0,\s*
+    100
+  \s*\)/100
+\s*\)
+(?:
+  \*\(\s*
+    (?P<injury_final_ratio>
+      (?:[0-9.]+|\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))
+      (?:\*[0-9.]+|\*\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))*
+    )
+  \s*\)
+  |
+  (?P<injury_final_ratio_empty>)
+)
+"""
+
+_physical_injury_regex = r"""
+MAX\(\s*
+  (?P<physical_line_1>
+    \(\s*
+      \(\s*
+        \(\s*
+          N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
+          (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
+          (?P<attack_first_value>(?:\+[0-9]+)*)
+        \s*\)
+        (?:
+          \*\(\s*1(?P<attack_first_ratio>(?:
+            [+*/][0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
+          )*)\s*\)
+          |
+          (?P<attack_first_ratio_empty>)
+        )
+        (?P<attack_final_value>(?:
+          \+[0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
+        )*)
+      \s*\)
+      (?P<attack_multiplier>(?:\*[0-9.]+)*)
+      (?P<attack_gain>(?:\+[0-9.]+)*)
+    \s*\)
+  )\*[0-9.]+,\s*
+  (?P<physical_line_2>
+    \(\s*
+      \(\s*
+        \(\s*
+          N\(\s*"(?:@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
+          (?:BaseAttack|BaseSummonAttack)[a-zA-Z0-9]+
+          (?:\+[0-9]+)*
+        \s*\)
+        (?:\*\(\s*1(?:[+*/][0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))*\s*\)|)
+        (?:\+[0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))*
+      \s*\)
+      (?:\*[0-9.]+)*
+      (?:\+[0-9.]+)*
+    \s*\)
+  )-
+  (?:
+    MAX\(\s*
+      \(\s*
+        \(\s*
+          (?:EnemyDefenseMajor|EnemyDefenseMinor)
+          (?:
+            -\(\s*(?P<defense_loss_value>
+              (?:[0-9.]+|\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))
+              (?:\+[0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))*
+            )\s*\)
+            |
+            -(?P<defense_loss_value_ungrouped>[0-9.]+)
+            |
+            (?P<defense_loss_value_empty>)
+          )
+        \s*\)
+        (?P<defense_loss_ratio>(?:\*[0-9.]+)*)
+        (?:
+          -\(\s*(?P<defense_ignore_value>(?:[0-9.]+)(?:\+[0-9.]+)*)\s*\)
+          |
+          -(?P<defense_ignore_value_ungrouped>[0-9.]+)
+          |
+          (?P<defense_ignore_value_empty>)
+        )
+      \s*\)
+      (?P<defense_ignore_ratio>(?:\*[0-9.]+)*)
+      ,\s*0
+    \s*\)
+    |
+    (?P<defense_ungrouped>EnemyDefenseMajor|EnemyDefenseMinor)
+  )
+\s*\)
+(?:
+  \*\(\s*
+    (?P<damage_final_ratio>
+      (?:[0-9.]+|\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))
+      (?:\*[0-9.]+|\*\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))*
+    )
+  \s*\)
+  |
+  (?P<damage_final_ratio_empty>)
+)
+(?P<physical_injury_multiplier>(?:\*[0-9.]+)*)
+\*\(\s*MEDIAN
+  \(\s*
+    100-(?:EnemyInjuryResistanceMajor|EnemyInjuryResistanceMinor),\s*
+    0,\s*
+    100
+  \s*\)/100
+\s*\)
+(?:
+  \*\(\s*
+    (?P<injury_final_ratio>
+      (?:[0-9.]+|\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))
+      (?:\*[0-9.]+|\*\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))*
+    )
+  \s*\)
+  |
+  (?P<injury_final_ratio_empty>)
+)
+"""
+
+_magical_injury_regex = r"""
+(?P<injury_main>
+  \(\s*
+    \(\s*
+      \(\s*
+        N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
         (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
         (?P<attack_first_value>(?:\+[0-9]+)*)
       \s*\)
@@ -3339,8 +3605,6 @@ _injury_regex = r"""
     (?P<damage_final_ratio_empty>)
   )
   (?P<magical_injury_multiplier>(?:\*[0-9.]+)*)
-  |
-  (?P<resist_empty>)
 )
 \*\(\s*MEDIAN
   \(\s*
