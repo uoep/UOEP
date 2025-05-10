@@ -6,7 +6,7 @@ UOEP是一个可广泛用于明日方舟干员、随着游戏更新不断发展�
 
 > 新版 v0.3.0 已发布，去下载最新版本 [明日方舟干员伤害数据表](https://github.com/uoep/UOEP/releases/latest)
 
-- 我想了解干员强度 👉 [干员强度图](https://www.bilibili.com/opus/1061288866989735944)
+- 我想了解干员强度 👉 [干员强度图](https://www.bilibili.com/opus/1065348117906325507)
 - 我想计算干员伤害 👉 [数据使用方法](docs/数据使用方法.md)
 - 我想学习计算原理 👉 [设计文档](docs/设计文档.md)
 
