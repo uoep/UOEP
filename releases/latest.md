@@ -4,7 +4,7 @@
 - [下载明日方舟干员伤害数据表](../data/%E6%98%8E%E6%97%A5%E6%96%B9%E8%88%9F%E5%B9%B2%E5%91%98%E4%BC%A4%E5%AE%B3%E6%95%B0%E6%8D%AE%E8%A1%A8.xlsb)（推荐，包含完整功能，需使用电脑打开）
 - [下载明日方舟干员伤害数据表 Lite 版](../data/%E6%98%8E%E6%97%A5%E6%96%B9%E8%88%9F%E5%B9%B2%E5%91%98%E4%BC%A4%E5%AE%B3%E6%95%B0%E6%8D%AE%E8%A1%A8%20Lite.xlsx)（不推荐，包含精简内容，支持手机、平板等设备，仅建议硬件或软件不符合要求的用户使用）
 
-![UOEP 当前版本封面图](../resources/cover.webp)
+<img src="../resources/cover.webp" alt="UOEP 当前版本封面图" width="600" height="auto" >
 
 ### What's new
 - 新增：收录干员：司霆惊蛰，酒神，澄闪(未进入对比范围)
