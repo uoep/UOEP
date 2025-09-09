@@ -2,6 +2,7 @@
 
 from enum import Enum
 from typing import Sequence, Callable, Iterable, Literal, Optional, Union
+from functools import cache
 import sys
 import os
 import re
@@ -21,9 +22,9 @@ _DEBUG = False
 def main() -> None:
     args = parse_args()
     if args.file:
-        run_file(args.transform_mode, args.minify_policy, args.dry_run)
+        run_file(args.transform_mode, args.generation_target, args.minify_policy, args.dry_run)
     else:
-        run_repl(args.transform_mode, args.minify_policy)
+        run_repl(args.transform_mode, args.generation_target, args.minify_policy)
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +45,12 @@ def parse_args() -> argparse.Namespace:
         default="buff",
         dest="to_type",
         help="formula target type",
+    )
+    parser.add_argument(
+        "--target",
+        choices=["excel", "javascript"],
+        default="excel",
+        help="code generation target language",
     )
     parser.add_argument(
         "--minify",
@@ -80,6 +87,21 @@ def parse_args() -> argparse.Namespace:
             args.transform_mode = TransformMode.ENDURANCE_ENEMY
         else:
             Assert.never()
+    if args.target == "excel":
+        args.generation_target = GenerationTarget.EXCEL
+    elif args.target == "javascript":
+        Assert.true(
+            (
+                args.from_type == "damage" and
+                args.to_type == "buff" and
+                (args.minify is None or args.minify == "off")
+            ),
+            "--target=javascript is currently only available for "
+            "--from=damage --to=buff --minify=off"
+        )
+        args.generation_target = GenerationTarget.JAVASCRIPT
+    else:
+        Assert.never()
     Assert.true(
         not (args.file and (args.minify == "off" or args.minify == "auto")),
         "--minify=off or --minify=auto is incompatible with --file"
@@ -88,26 +110,34 @@ def parse_args() -> argparse.Namespace:
         not args.dry_run or args.file,
         "--dry-run must be used together with --file"
     )
-    if args.file:
-        args.minify_policy = MinifyPolicy.MAX
-    else:
-        if args.minify is None or args.minify == "auto":
-            args.minify_policy = MinifyPolicy.ON_DEMAND
-        elif args.minify == "off":
-            args.minify_policy = MinifyPolicy.NO_MINIFY
-        elif args.minify == "max":
+    if args.target == "excel":
+        if args.file:
             args.minify_policy = MinifyPolicy.MAX
         else:
-            Assert.never()
+            if args.minify is None or args.minify == "auto":
+                args.minify_policy = MinifyPolicy.ON_DEMAND
+            elif args.minify == "off":
+                args.minify_policy = MinifyPolicy.NO_MINIFY
+            elif args.minify == "max":
+                args.minify_policy = MinifyPolicy.MAX
+            else:
+                Assert.never()
+    elif args.target == "javascript":
+        args.minify_policy = MinifyPolicy.NO_MINIFY
+    else:
+        Assert.never()
     return args
 
 
 def run_file(
-        transform_mode: "TransformMode", minify_policy: "MinifyPolicy", dry_run: bool,
+        transform_mode: "TransformMode",
+        generation_target: "GenerationTarget",
+        minify_policy: "MinifyPolicy",
+        dry_run: bool,
     ) -> None:
     with open(_INPUT_FILENAME, encoding="utf-8") as f:
         formula = f.read()
-    engine = Engine(transform_mode, minify_policy, IoMode.FILE)
+    engine = Engine(transform_mode, generation_target, minify_policy, IoMode.FILE)
     formula = engine.run(formula)
     if dry_run:
         return
@@ -115,10 +145,14 @@ def run_file(
         f.write(formula)
 
 
-def run_repl(transform_mode: "TransformMode", minify_policy: "MinifyPolicy") -> None:
+def run_repl(
+        transform_mode: "TransformMode",
+        generation_target: "GenerationTarget",
+        minify_policy: "MinifyPolicy"
+    ) -> None:
     print("Formula >")
     print("=" * 60)
-    engine = Engine(transform_mode, minify_policy, IoMode.REPL)
+    engine = Engine(transform_mode, generation_target, minify_policy, IoMode.REPL)
     while True:
         formula = ""
         for line in sys.stdin:
@@ -149,11 +183,14 @@ class Engine:
     def __init__(
             self,
             transform_mode: "TransformMode",
+            generation_target: "GenerationTarget",
             minify_policy: "MinifyPolicy",
             io_mode: "IoMode",
         ) -> None:
         self._visitors = self._get_available_visitors(transform_mode)
-        self._transformers = self._get_available_transformers(transform_mode, minify_policy)
+        self._transformers = self._get_available_transformers(
+            transform_mode, generation_target, minify_policy
+        )
         self._io_mode = io_mode
 
     def run(self, formula: str) -> str:
@@ -184,6 +221,7 @@ class Engine:
     def _get_available_transformers(
             self,
             transform_mode: "TransformMode",
+            generation_target: "GenerationTarget",
             minify_policy: "MinifyPolicy"
         ) -> Iterable["Transformer"]:
         transformers = []
@@ -198,9 +236,9 @@ class Engine:
                 DirectInjuryBuffInjector(),
                 PhysicalInjuryBuffInjector(),
                 MagicalInjuryBuffInjector(),
-                AutomaticSkillBuffInjector(),
-                OffensiveSkillAttackCountInjector(),
-                OffensiveSkillInjector(),
+                AutomaticSkillBuffInjector(generation_target),
+                OffensiveSkillAttackCountInjector(generation_target),
+                OffensiveSkillInjector(generation_target),
                 AttackSpanBuffInjector(),
                 ManualAttackSpeedBuffInjector(),
             ])
@@ -216,9 +254,26 @@ class Engine:
         transformers.extend(self._get_custom_post_tranformers(transform_mode))
         transformers.extend([
             ReturnPredicateRemover(),
-            BuffInvalidateWrapper(transform_mode),
-            Minifier(minify_policy),
+            BuffInvalidateWrapper(transform_mode, generation_target),
         ])
+        if generation_target == GenerationTarget.EXCEL:
+            transformers.extend([
+                Minifier(generation_target, minify_policy)
+            ])
+        elif generation_target == GenerationTarget.JAVASCRIPT:
+            transformers.extend(
+                self._get_target_specific_pre_transformers(transform_mode, generation_target)
+            )
+            transformers.extend([
+                LetBindingTranslator(generation_target),
+                MultiLineStringTranslator(generation_target),
+                EqualSignTranslator(generation_target),
+            ])
+            transformers.extend(
+                self._get_target_specific_post_transformers(transform_mode, generation_target)
+            )
+        else:
+            Assert.never()
         return transformers
 
     def _get_custom_pre_transformers(
@@ -272,6 +327,65 @@ class Engine:
             result.append(SingleWordReplacer(keyword=key, replacement=value))
         return result
 
+    def _get_target_specific_pre_transformers(
+            self, transform_mode: "TransformMode", generation_target: "GenerationTarget"
+        ) -> Sequence["Transformer"]:
+        Assert.true(
+            generation_target == GenerationTarget.JAVASCRIPT,
+            "Only JavaScript target has target-specific transformers"
+        )
+        return [
+            RegexReplacer(
+                regex="(?<!<|>)=",
+                replacement_provider=
+                    lambda context: (
+                        "==="
+                        if (
+                            context.match.start() > 0 and
+                            not MultiLineStringTranslator.is_index_in_quotes(
+                                context.original_formula, context.match.start()
+                            )
+                        )
+                        else None
+                    ),
+                single_line=True,
+            ),
+            RegexReplacer("<>", lambda _: "!==", single_line=True),
+        ]
+
+    def _get_target_specific_post_transformers(
+            self, transform_mode: "TransformMode", generation_target: "GenerationTarget"
+        ) -> Sequence["Transformer"]:
+        Assert.true(
+            generation_target == GenerationTarget.JAVASCRIPT,
+            "Only JavaScript target has target-specific transformers"
+        )
+        if transform_mode.from_damage() and transform_mode.to_buff():
+            result = []
+            for key, value in JavaScriptTarget.TRANSLATION_PAIRS.items():
+                result.append(SingleWordReplacer(keyword=key, replacement=value))
+            result.append(
+                # IMPORTANT:
+                # After adapting BaseAttack* to JavaScript target, the whole engine
+                # will not work any more due to unable to get subject from the formula;
+                # make sure this is the last transformer in the queue
+                RegexReplacer(
+                    regex="(?P<type>BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)",
+                    replacement_provider=(
+                        lambda context:
+                            f'base.{context.match.group("id")}.'
+                            f'{
+                                "summonAttack"
+                                if context.match.group("type") == "BaseSummonAttack"
+                                else "attack"
+                            }'
+                    ),
+                ),
+            )
+            return result
+        else:
+            Assert.never()
+        
     def _unescape(self, formula: str) -> str:
         if formula.startswith('"'):
             formula = re.sub(r'(?<!")"(?!")', '', formula)
@@ -460,23 +574,29 @@ class Assert:
         raise RuntimeError("Control reaches unreachable code")
 
     @classmethod
-    def fail(cls, error_message: str) -> None:
-        raise ValueError(error_message)
+    def fail(cls, error: str) -> None:
+        if isinstance(error, str):
+            raise ValueError(error)
+        else:
+            raise error
 
     @classmethod
     def true(
         cls,
         predicate: bool,
-        error_message: str,
+        error: str | Exception,
         groups: dict[str, str | None] | None = None,
     ) -> None:
         if not predicate:
-            message = (
-                f"{error_message}\n{cls._dump(groups)}"
-                if groups is not None
-                else error_message
-            )
-            raise ValueError(message)
+            if isinstance(error, str):
+                message = (
+                    f"{error}\n{cls._dump(groups)}"
+                    if groups is not None
+                    else error
+                )
+                raise ValueError(message)
+            else:
+                raise error
 
     @staticmethod
     def override(super_class: type) -> Callable[[Callable], Callable]:
@@ -513,6 +633,7 @@ class FormulaContext:
             )
         ), "Illegal arguments")
         self._formula = formula
+        self._original_formula = formula
         self._operator_ids = tuple(operator_ids)
         self._summon_ids = tuple(summon_ids)
         self._operators = tuple(Operator(operator_id) for operator_id in operator_ids)
@@ -535,6 +656,10 @@ class FormulaContext:
     @property
     def formula(self) -> str:
         return self._formula
+
+    @property
+    def original_formula(self) -> str:
+        return self._original_formula
 
     @property
     def operators(self) -> Sequence["Operator"]:
@@ -633,6 +758,10 @@ class MatchContext:
         return self._parent.formula
 
     @property
+    def original_formula(self) -> str:
+        return self._parent.original_formula
+
+    @property
     def match(self) -> re.Match:
         return self._match
 
@@ -683,6 +812,9 @@ class MatchContext:
 
     def replace(self, text: str, subpattern_name: str, allow_shorten: bool = False) -> None:
         start, end = self._match.span(subpattern_name)
+        self.replace_by_index(text, start, end, allow_shorten)
+
+    def replace_by_index(self, text: str, start: int, end: int, allow_shorten: bool = False) -> None:
         self._parent.replace(text, start, end, allow_shorten)
 
     def get(self, subpattern_name: str) -> str:
@@ -740,6 +872,11 @@ class TransformMode(Enum):
             TransformMode.DAMAGE_ENEMY,
             TransformMode.ENDURANCE_ENEMY,
         )
+
+
+class GenerationTarget(Enum):
+    EXCEL = "Excel"
+    JAVASCRIPT = "JavaScript"
 
 
 class MinifyPolicy(Enum):
@@ -1653,7 +1790,7 @@ class PhysicalDamageBuffInjector(DamageBuffInjector):
                     "defense_ignore_value_empty",
                 ]) and
                 Check.not_none(groups, "defense_ignore_ratio")
-            ), error_message="Sanity check failed", groups=groups)
+            ), error="Sanity check failed", groups=groups)
         Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
 
     def _inject_physical_line_2(self, context: MatchContext) -> None:
@@ -1714,7 +1851,7 @@ class MagicalDamageBuffInjector(DamageBuffInjector):
                 Check.not_none(groups, "resist_ignore_ratio")
             ) or (
                 Check.not_none(groups, "resist_ungrouped")
-            ), error_message="Sanity check failed", groups=groups)
+            ), error="Sanity check failed", groups=groups)
         Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
 
 
@@ -1936,7 +2073,7 @@ class PhysicalInjuryBuffInjector(InjuryBuffInjector):
                     "defense_ignore_value_empty",
                 ]) and
                 Check.not_none(groups, "defense_ignore_ratio")
-            ), error_message="Sanity check failed", groups=groups)
+            ), error="Sanity check failed", groups=groups)
         Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
         Assert.either(groups, ["injury_final_ratio", "injury_final_ratio_empty"])
 
@@ -1998,7 +2135,7 @@ class MagicalInjuryBuffInjector(InjuryBuffInjector):
                 Check.not_none(groups, "resist_ignore_ratio")
             ) or (
                 Check.not_none(groups, "resist_ungrouped")
-            ), error_message="Sanity check failed", groups=groups)
+            ), error="Sanity check failed", groups=groups)
         Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
         Assert.either(groups, ["injury_final_ratio", "injury_final_ratio_empty"])
 
@@ -2081,7 +2218,8 @@ class ManualAttackSpeedBuffInjector(AttackSpeedBuffInjector):
 
 
 class AutomaticSkillBuffInjector(BuffInjector):
-    def __init__(self):
+    def __init__(self, generation_target: GenerationTarget):
+        self._generation_target = generation_target
         super().__init__()
 
     @Assert.override(Transformer)
@@ -2130,15 +2268,26 @@ class AutomaticSkillBuffInjector(BuffInjector):
         else:
             Assert.never()
         max_sp = context.get("skill_automatic_max")
-        context.replace(
-            f'((MATCH({max_sp}-0.00001,'
-            f'INDEX(AutoSkill!$A$1:$U$3600,0,ROUND((0{recovery})/0.05,0)+1),1)+1)/30)',
-            subpattern_name="skill_automatic_main",
-        )
+        if self._generation_target == GenerationTarget.EXCEL:
+            context.replace(
+                f'((MATCH({max_sp}-0.00001,'
+                f'INDEX(AutoSkill!$A$1:$U$3600,0,ROUND((0{recovery})/0.05,0)+1),1)+1)/30)',
+                subpattern_name="skill_automatic_main",
+            )
+        elif self._generation_target == GenerationTarget.JAVASCRIPT:
+            # complex skill control (gain Y sp per X second) not yet supported
+            # for javascript target
+            context.replace(
+                f'({max_sp}/(1{recovery}))',
+                subpattern_name="skill_automatic_main"
+            )
+        else:
+            Assert.never()
 
 
 class OffensiveSkillAttackCountInjector(Transformer):
-    def __init__(self):
+    def __init__(self, generation_target: GenerationTarget):
+        self._generation_target = generation_target
         super().__init__()
 
     @Assert.override(Transformer)
@@ -2164,16 +2313,28 @@ class OffensiveSkillAttackCountInjector(Transformer):
     def _inject_offensive_attack_count_skill_point(self, context: MatchContext) -> None:
         attack_span = context.match.group("attack_span")
         attack_count = context.match.group("skill_offensive_attack_count")
-        context.replace(
-            f'ROUNDDOWN(((MATCH({attack_count}-0.00001,'
-            f'INDEX(AttackSkill!$A$1:$DA$1200,0,{attack_span}*30),1)+1)/30)'
-            f'/{attack_span},0)',
-            subpattern_name="skill_offensive_attack_main",
-        )
+        if self._generation_target == GenerationTarget.EXCEL:
+            context.replace(
+                f'ROUNDDOWN(((MATCH({attack_count}-0.00001,'
+                f'INDEX(AttackSkill!$A$1:$DA$1200,0,{attack_span}*30),1)+1)/30)'
+                f'/{attack_span},0)',
+                subpattern_name="skill_offensive_attack_main",
+            )
+        elif self._generation_target == GenerationTarget.JAVASCRIPT:
+            # complex skill control (gain Y sp per X second) not yet supported
+            # for javascript target
+            context.replace(
+                f'({attack_count})',
+                subpattern_name="skill_offensive_attack_main",
+                allow_shorten=True
+            )
+        else:
+            Assert.never()
 
 
 class OffensiveSkillInjector(Transformer):
-    def __init__(self):
+    def __init__(self, generation_target: GenerationTarget):
+        self._generation_target = generation_target
         super().__init__()
 
     @Assert.override(Transformer)
@@ -2199,11 +2360,22 @@ class OffensiveSkillInjector(Transformer):
     def _inject_offensive_skill_point(self, context: MatchContext) -> None:
         attack_span = context.match.group("attack_span")
         max_sp = context.match.group("skill_offensive_max")
-        context.replace(
-            f'((MATCH({max_sp}-0.00001,'
-            f'INDEX(AttackSkill!$A$1:$DA$1200,0,{attack_span}*30),1)+1)/30)',
-            subpattern_name="skill_offensive_main",
-        )
+        if self._generation_target == GenerationTarget.EXCEL:
+            context.replace(
+                f'((MATCH({max_sp}-0.00001,'
+                f'INDEX(AttackSkill!$A$1:$DA$1200,0,{attack_span}*30),1)+1)/30)',
+                subpattern_name="skill_offensive_main",
+            )
+        elif self._generation_target == GenerationTarget.JAVASCRIPT:
+            # complex skill control (gain Y sp per X second) not yet supported
+            # for javascript target
+            context.replace(
+                f'({max_sp}*{attack_span})',
+                subpattern_name="skill_offensive_main",
+                allow_shorten=True
+            )
+        else:
+            Assert.never()
 
 
 class EnduranceBuffInjector(BuffInjector):
@@ -2812,8 +2984,8 @@ class EnduranceFormulaGenerator(WholeTransformer):
 
 
 class BuffInvalidateWrapper(WholeTransformer):
-    def __init__(self, transform_mode: TransformMode):
-        self._invalid_value = self._get_invalid_value(transform_mode)
+    def __init__(self, transform_mode: TransformMode, generation_target: GenerationTarget):
+        self._invalid_value = self._get_invalid_value(transform_mode, generation_target)
         prefix = self._get_buff_prefix(transform_mode)
         self._apply_to_single_ally_only_literal = f"{prefix}ApplyToSingleAllyOnly"
         self._apply_to_non_summon_ally_only_literal = f"{prefix}ApplyToNonSummonAllyOnly"
@@ -2883,11 +3055,21 @@ class BuffInvalidateWrapper(WholeTransformer):
         for short_subject_id in short_subject_ids:
             yield f'ISNUMBER(SEARCH("{short_subject_id}",BuffSourceIds))'
 
-    def _get_invalid_value(self, transform_mode: TransformMode) -> str:
-        if transform_mode.from_damage():
-            return "0"
-        elif transform_mode.from_endurance():
-            return "NA()"
+    def _get_invalid_value(
+            self, transform_mode: TransformMode, generation_target: GenerationTarget
+        ) -> str:
+        if generation_target == GenerationTarget.EXCEL:
+            if transform_mode.from_damage():
+                return "0"
+            elif transform_mode.from_endurance():
+                return "NA()"
+            else:
+                Assert.never()
+        elif generation_target == GenerationTarget.JAVASCRIPT:
+            if transform_mode.from_damage():
+                return "0"
+            else:
+                Assert.never()
         else:
             Assert.never()
 
@@ -2902,13 +3084,13 @@ class BuffInvalidateWrapper(WholeTransformer):
 
 class SingleWordReplacer(Transformer):
     def __init__(self, keyword: str, replacement: str):
-        self.keyword = keyword
-        self.replacement = replacement
+        self._keyword = keyword
+        self._replacement = replacement
         super().__init__()
 
     @Assert.override(Transformer)
     def _get_pattern(self) -> re.Pattern:
-        return re.compile(fr"(?P<keyword>\b{self.keyword}\b)", re.M | re.X)
+        return re.compile(fr"(?P<keyword>\b{self._keyword}\b)", re.M | re.X)
 
     @Assert.override(Transformer)
     def _ensure_valid(self, match: re.Match) -> None:
@@ -2920,9 +3102,51 @@ class SingleWordReplacer(Transformer):
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
             lambda context: context.replace(
-                self.replacement, subpattern_name="keyword", allow_shorten=True
+                self._replacement, subpattern_name="keyword", allow_shorten=True
             )
         ]
+
+
+class RegexReplacer(Transformer):
+    def __init__(
+            self,
+            regex: str,
+            replacement_provider: Callable[[MatchContext], Optional[str]],
+            single_line: bool = False,
+        ):
+        self._regex = regex
+        self._replacement_provider = replacement_provider
+        self._single_line = single_line
+        super().__init__()
+
+    @Assert.override(Transformer)
+    def _get_pattern(self) -> re.Pattern:
+        pattern = fr"(?P<__custom_regex__>{self._regex})"
+        if self._single_line:
+            return re.compile(pattern)
+        else:
+            return re.compile(pattern, re.M | re.X)
+
+    @Assert.override(Transformer)
+    def _ensure_valid(self, match: re.Match) -> None:
+        groups = match.groupdict()
+        Assert.has_key(groups, ["__custom_regex__"])
+        Assert.not_empty(groups, ["__custom_regex__"])
+
+    @Assert.override(Transformer)
+    def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
+        return [
+            self._replace,
+        ]
+
+    def _replace(self, context: MatchContext) -> None:
+        replacement = self._replacement_provider(context)
+        if replacement is not None:
+            context.replace(
+                replacement,
+                subpattern_name="__custom_regex__",
+                allow_shorten=True,
+            )
 
 
 class ReturnPredicateRemover(Transformer):
@@ -2948,9 +3172,310 @@ class ReturnPredicateRemover(Transformer):
         ]
 
 
+class LetBindingTranslator(Transformer):
+    class SyntaxError(ValueError):
+        """Error indicating illegal let binding syntax"""
+        pass
+
+    def __init__(self, generation_target: GenerationTarget):
+        Assert.true(
+            generation_target == GenerationTarget.JAVASCRIPT,
+            "Let binding translator only supports JavaScript target"
+        )
+        super().__init__()
+
+    @Assert.override(Transformer)
+    def _get_pattern(self) -> re.Pattern:
+        return re.compile(r'\bLET\b\(', re.M | re.X)
+
+    @Assert.override(Transformer)
+    def _ensure_valid(self, match: re.Match) -> None:
+        return True
+
+    @Assert.override(Transformer)
+    def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
+        return [
+            self._translate,
+        ]
+
+    def _translate(self, context: MatchContext) -> None:
+        move_when, move_until, back_when, back_until = (
+            self._get_movers(context.original_formula)
+        )
+        let_start_index = context.match.start()
+        index = context.match.end()
+        Assert.true(
+            context.original_formula[index] == "\n",
+            self.SyntaxError("Expect a new line after `LET(`")
+        )
+        back_index, _ = back_until(" \n^", index - 1)
+        _, base_indent = back_when(" ^", back_index)
+        index += 1
+        definition_pairs = []
+        # find variable definitions
+        while True:
+            start_index, indent = move_when(" ", index)
+            Assert.true(
+                base_indent < indent,
+                self.SyntaxError("Expect LET() to have deeper indent than outside")
+            )
+            line_end_index, _ = move_until("\n", start_index)
+            line = context.original_formula[start_index:line_end_index]
+            comma_index, _ = move_until(",\n", start_index)
+            before_comma = context.original_formula[start_index:comma_index]
+            if (
+                line == "(" or
+                context.original_formula[comma_index] == "\n" or
+                (context.original_formula[comma_index] == "," and "(" in before_comma)
+            ):
+                # finished variable definitions
+                Assert.true(
+                    len(definition_pairs) >= 1,
+                    self.SyntaxError("Expect at least one variable definition in let binding")
+                )
+                let_body_indent = indent
+                break
+            var_end_index, _ = move_until(",", start_index)
+            variable_name = context.original_formula[start_index:var_end_index]
+            # get full variable definition
+            definition_index = var_end_index
+            while True:
+                # check whether this variable definition is continued at next line
+                line_end_index, _ = move_until("\n", definition_index + 1)
+                next_start_index, next_indent = move_when(" ", line_end_index + 1)
+                if indent == next_indent:
+                    next_line_end_index, _ = move_until("\n", next_start_index)
+                    next_line = context.original_formula[next_start_index:next_line_end_index]
+                    Assert.true(
+                        len(next_line) >= 1,
+                        self.SyntaxError("Expect non-empty line in let binding")
+                    )
+                    if definition_index == var_end_index:
+                        if next_line == "(":
+                            if line_end_index == var_end_index + 1:
+                                # direct newline after variable name
+                                # variable definition continues at next line
+                                definition_index = line_end_index
+                                continue
+                            else:
+                                # text between variable name and next line
+                                # next line is let body
+                                # variable definition ends at this line
+                                definition_index = line_end_index
+                                break
+                        elif ord('A') <= ord(next_line[0]) <= ord('Z'):
+                            # new variable at next line
+                            # variable definition ends at this line
+                            definition_index = line_end_index
+                            break
+                        else:
+                            Assert.fail(self.SyntaxError(
+                                "Expect next line of let variable to be either `(` "
+                                f"or another variable, got `{next_line}`"
+                            ))
+                    else:
+                        if next_line == "),":
+                            # variable definition ends at next line
+                            definition_index = next_line_end_index
+                            break
+                        else:
+                            Assert.fail(self.SyntaxError(
+                                "Expect let variable definition to end with `),`, "
+                                f"got `{next_line}`"
+                            ))
+                elif indent < next_indent:
+                    # variable definition continues at next line
+                    definition_index = line_end_index
+                    continue
+                else:
+                    Assert.fail(self.SyntaxError(
+                        "Expect LET() variable definition to have deeper indent than outside"
+                    ))
+            Assert.true(
+                context.original_formula[definition_index - 1] == ",",
+                self.SyntaxError("Expect `,` after variable definition in let binding")
+            )
+            definition = context.original_formula[var_end_index + 1 : definition_index - 1].strip()
+            definition_pairs.append((variable_name, definition))
+            index = definition_index + 1
+        # find let body
+        let_body_start_index, _ = move_when(" ", index)
+        index, _ = move_until("\n", index)
+        index += 1
+        while True:
+            line_end_index, _ = move_until("\n", index)
+            line_end_strip_index, _ = back_when(" ", line_end_index - 1)
+            start_index, _ = back_until(" \n", line_end_strip_index)
+            if index > start_index:
+                # empty line, ignore it
+                index = line_end_index + 1
+                continue
+            _, indent = back_when(" ", start_index)
+            if let_body_indent == indent:
+                let_body_end = context.original_formula[start_index+1:line_end_strip_index+1]
+                if let_body_end != ")":
+                    Assert.true(
+                        let_body_end.startswith(")") and not let_body_end.endswith("("),
+                        self.SyntaxError(f"Expect let body to end with `)`, got `{let_body_end}`")
+                    )
+                    print(f"SyntaxWarning: Expect let body to end with `)`, got `{let_body_end}`")
+                index = line_end_index
+                break
+            index = line_end_index + 1
+        let_body_end_index = index
+        let_body = context.original_formula[let_body_start_index:let_body_end_index]
+        # find the end of the whole let part
+        index, _ = move_when(" ", index + 1)
+        index, _ = move_until(")", index)
+        let_end_index = index + 1
+        # generate result
+        let_function_body = "\n"
+        let_function_body_indent = " " * let_body_indent
+        let_indent = " " * base_indent
+        for var, definition in definition_pairs:
+            let_function_body += let_function_body_indent + f"const {var}={definition}\n"
+        let_function_body += let_function_body_indent + f"return {let_body}\n"
+        let_function = f"(function(){{{let_function_body}{let_indent}}})()"
+        context.replace_by_index(let_function, let_start_index, let_end_index)
+
+    def _get_movers(self, formula: str) -> tuple[
+            Callable[[str, int], tuple[int, int]],
+            Callable[[str, int], tuple[int, int]],
+            Callable[[str, int], tuple[int, int]],
+            Callable[[str, int], tuple[int, int]],
+        ]:
+        length = len(formula)
+        def build_charset(chars: str) -> Sequence[str]:
+            error_message = "Illegal chars when building charset"
+            Assert.true(len(chars) >= 1, error_message)
+            charset = []
+            if len(chars) == 1:
+                Assert.true(chars != "^" and chars != "$", error_message)
+                charset.append(chars)
+            else:
+                for char in chars:
+                    if char != "^" and char != "$":
+                        charset.append(char)
+            stop_left = "^" in chars
+            stop_right = "$" in chars
+            return charset, stop_left, stop_right
+        def _move_when(formula: str, chars: str, start: int) -> tuple[int, int]:
+            index = start
+            charset, _, stop_right = build_charset(chars)
+            while formula[index] in charset:
+                index += 1
+                if index == length:
+                    Assert.true(stop_right, "Illegal forward move across border")
+                    break
+            return index, index - start
+        def _move_until(formula: str, chars: str, start: int) -> tuple[int, int]:
+            index = start
+            charset, _, stop_right = build_charset(chars)
+            while formula[index] not in charset:
+                index += 1
+                if index == length:
+                    Assert.true(stop_right, "Illegal forward move across border")
+                    break
+            return index, index - start
+        def _back_when(formula: str, chars: str, start: int) -> tuple[int, int]:
+            index = start
+            charset, stop_left, _ = build_charset(chars)
+            while formula[index] in charset:
+                index -= 1
+                if index == 0:
+                    Assert.true(stop_left, "Illegal backward move across border")
+                    break
+            return index, start - index
+        def _back_until(formula: str, chars: str, start: int) -> tuple[int, int]:
+            index = start
+            charset, stop_left, _ = build_charset(chars)
+            while formula[index] not in charset:
+                index -= 1
+                if index == 0:
+                    Assert.true(stop_left, "Illegal backward move across border")
+                    break
+            return index, start - index
+        move_when = lambda char, start: _move_when(formula, char, start)
+        move_until = lambda char, start: _move_until(formula, char, start)
+        back_when = lambda char, start: _back_when(formula, char, start)
+        back_until = lambda char, start: _back_until(formula, char, start)
+        return move_when, move_until, back_when, back_until
+
+
+class MultiLineStringTranslator(WholeTransformer):
+    def __init__(self, generation_target: GenerationTarget):
+        Assert.true(
+            generation_target == GenerationTarget.JAVASCRIPT,
+            "Multi-line string translator only supports JavaScript target"
+        )
+        super().__init__()
+
+    @Assert.override(Transformer)
+    def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
+        return [
+            self._translate,
+        ]
+
+    @classmethod
+    def is_index_in_quotes(cls, formula: str, index: int) -> bool:
+        for start, end in cls._get_double_quote_spans(formula):
+            if start < index < end:
+                return True
+        return False
+
+    def _translate(self, context: MatchContext):
+        for start, end in self._get_double_quote_spans(context.original_formula):
+            string = context.original_formula[start:end]
+            Assert.true(end - start >= 2, "Illegal quote indexes")
+            if "\n" in string:
+                context.replace_by_index(f'`{string[1:-1]}`', start, end, allow_shorten=True)
+
+    @classmethod
+    @cache
+    def _get_double_quote_spans(cls, formula: str) -> Sequence[tuple[int, int]]:
+        spans: list[tuple[int, int]] = []
+        length = len(formula)
+        index = 0
+        while index < length:
+            if formula[index] == '"':
+                end_index = index + 1
+                while formula[end_index] != '"':
+                    end_index += 1
+                    Assert.true(end_index < length, "Illegal formula with unpaired quotes")
+                spans.append((index, end_index + 1))
+                index = end_index + 1
+            else:
+                index += 1
+        return spans
+
+
+class EqualSignTranslator(WholeTransformer):
+    def __init__(self, generation_target: GenerationTarget):
+        Assert.true(
+            generation_target == GenerationTarget.JAVASCRIPT,
+            "Equal sign remover only supports JavaScript target"
+        )
+        super().__init__()
+
+    @Assert.override(Transformer)
+    def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
+        return [
+            lambda context: context.replace(
+                text=f"return {context.get_all()[1:]}",
+                subpattern_name="all",
+                allow_shorten=True
+            )
+        ]
+
+
 class Minifier(WholeTransformer):
-    def __init__(self, minify_policy: MinifyPolicy):
+    def __init__(self, generation_target: GenerationTarget, minify_policy: MinifyPolicy):
+        Assert.true(
+            generation_target == GenerationTarget.EXCEL,
+            "Currently only Excel target code can be minified"
+        )
         self._max_legal_length = 8192
+        self._generation_target = generation_target
         self._minify_policy = minify_policy
         super().__init__()
 
@@ -3104,6 +3629,94 @@ class Minifier(WholeTransformer):
     }
 
     _auto_variables = ()
+
+
+class JavaScriptTarget:
+    _PREFIX = "control.value"
+    _PREFIX_ENEMY = f"{_PREFIX}.enemy"
+    _PREFIX_BUFF = f"{_PREFIX}.buff"
+    _PREFIX_BUFF_DAMAGE = f"{_PREFIX_BUFF}.damage"
+    _PREFIX_LITERAL = f"{_PREFIX}.literal"
+
+    TRANSLATION_PAIRS = {
+        "EnemyDefenseMajor": f"{_PREFIX_ENEMY}.major.defense",
+        "EnemyResistanceMajor": f"{_PREFIX_ENEMY}.major.resistance",
+        "EnemyElementalResistanceMajor": f"{_PREFIX_ENEMY}.major.elementalResistance",
+        "EnemyInjuryResistanceMajor": f"{_PREFIX_ENEMY}.major.injuryResistance",
+        "EnemyRankMajor": f"{_PREFIX_ENEMY}.major.rank",
+        "EnemyMaxElementMajor": f"{_PREFIX_ENEMY}.major.maxElement",
+        "EnemyWeightMajor": f"{_PREFIX_ENEMY}.major.weight",
+        "EnemyCountMinor": f"{_PREFIX_ENEMY}.minor.count",
+        "EnemyDefenseMinor": f"{_PREFIX_ENEMY}.minor.defense",
+        "EnemyResistanceMinor": f"{_PREFIX_ENEMY}.minor.resistance",
+        "EnemyElementalResistanceMinor": f"{_PREFIX_ENEMY}.minor.elementalResistance",
+        "EnemyInjuryResistanceMinor": f"{_PREFIX_ENEMY}.minor.injuryResistance",
+        "EnemyRankMinor": f"{_PREFIX_ENEMY}.minor.rank",
+        "EnemyMaxElementMinor": f"{_PREFIX_ENEMY}.minor.maxElement",
+        "EnemyWeightMinor": f"{_PREFIX_ENEMY}.minor.weight",
+        "EnemyDamageTimeWindow": f"{_PREFIX_ENEMY}.damageTimeWindow",
+        "EnemyAerial": f"{_PREFIX_ENEMY}.aerial",
+        "EnemySeparated": f"{_PREFIX_ENEMY}.separated",
+        "BuffSourceIds": f"{_PREFIX_BUFF}.sourceIds",
+        "BuffDamageApplyToSingleAllyOnly": f"{_PREFIX_BUFF_DAMAGE}.applyToSingleAllyOnly",
+        "BuffDamageApplyToNonSummonAllyOnly": f"{_PREFIX_BUFF_DAMAGE}.applyToNonSummonAllyOnly",
+        "BuffDamageApplyToSingleEnemyOnly": f"{_PREFIX_BUFF_DAMAGE}.applyToSingleEnemyOnly",
+        "BuffDamageAttackFirstValue": f"{_PREFIX_BUFF_DAMAGE}.attackFirstValue",
+        "BuffDamageAttackFinalValue": f"{_PREFIX_BUFF_DAMAGE}.attackFinalValue",
+        "BuffDamageAttackFirstRatio": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatio",
+        "BuffDamageAttackFirstRatioVanguard": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioVanguard",
+        "BuffDamageAttackFirstRatioGuard": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioGuard",
+        "BuffDamageAttackFirstRatioDefender": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioDefender",
+        "BuffDamageAttackFirstRatioSniper": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioSniper",
+        "BuffDamageAttackFirstRatioCaster": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioCaster",
+        "BuffDamageAttackFirstRatioMedic": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioMedic",
+        "BuffDamageAttackFirstRatioSupporter": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioSupporter",
+        "BuffDamageAttackFirstRatioSpecialist": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioSpecialist",
+        "BuffDamageAttackFirstRatioMelee": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioMelee",
+        "BuffDamageAttackSpeedFirstValue": f"{_PREFIX_BUFF_DAMAGE}.attackSpeedFirstValue",
+        "BuffDamageAttackSpeedFirstValueSniper": f"{_PREFIX_BUFF_DAMAGE}.attackSpeedFirstValueSniper",
+        "BuffDamageAttackSpeedFirstValueMelee": f"{_PREFIX_BUFF_DAMAGE}.attackSpeedFirstValueMelee",
+        "BuffDamageAttackSpeedFirstValueRanged": f"{_PREFIX_BUFF_DAMAGE}.attackSpeedFirstValueRanged",
+        "BuffDamagePhysicalGainValue": f"{_PREFIX_BUFF_DAMAGE}.physicalGainValue",
+        "BuffDamageMagicalGainValue": f"{_PREFIX_BUFF_DAMAGE}.magicalGainValue",
+        "BuffDamageTrueGainValue": f"{_PREFIX_BUFF_DAMAGE}.trueGainValue",
+        "BuffDamageElementalGainValue": f"{_PREFIX_BUFF_DAMAGE}.elementalGainValue",
+        "BuffDamagePhysicalFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.physicalFinalRatio",
+        "BuffDamageMagicalFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.magicalFinalRatio",
+        "BuffDamageTrueFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.trueFinalRatio",
+        "BuffDamageElementalFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.elementalFinalRatio",
+        "BuffDamageInjuryFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.injuryFinalRatio",
+        "BuffDamageInjurySanityFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.injurySanityFinalRatio",
+        "BuffDamageInjuryFireFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.injuryFireFinalRatio",
+        "BuffDamageInjuryDarkFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.injuryDarkFinalRatio",
+        "BuffDamageSkillPointValueAutomatic": f"{_PREFIX_BUFF_DAMAGE}.skillPointValueAutomatic",
+        "BuffDamageEnemyDefenseLossValue": f"{_PREFIX_BUFF_DAMAGE}.enemyDefenseLossValue",
+        "BuffDamageEnemyDefenseLossFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.enemyDefenseLossFinalRatio",
+        "BuffDamageEnemyResistanceLossValue": f"{_PREFIX_BUFF_DAMAGE}.enemyResistanceLossValue",
+        "BuffDamageEnemyResistanceLossFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.enemyResistanceLossFinalRatio",
+        "BuffDamageMonoEncouragedAttackFinalValue": f"{_PREFIX_BUFF_DAMAGE}.monoEncouragedAttackFinalValue",
+        "BuffDamageMonoEnergizedAttackFirstRatio": f"{_PREFIX_BUFF_DAMAGE}.monoEnergizedAttackFirstValue",
+        "BuffDamageMonoEnergizedAttackFirstRatioMelee": f"{_PREFIX_BUFF_DAMAGE}.monoEnergizedAttackFirstValueMelee",
+        "BuffDamageMonoEnemyStolenDefenseLossValue": f"{_PREFIX_BUFF_DAMAGE}.monoEnemyStolenDefenseLossValue",
+        "BuffDamageMonoEnemyFrozenResistanceLossValue": f"{_PREFIX_BUFF_DAMAGE}.monoEnemyFrozenResistanceLossValue",
+        "BuffDamageMonoEnemyVulnerableFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.monoEnemyVulnerableFinalRatio",
+        "BuffDamageMonoEnemyVulnerablePhysicalFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.monoEnemyVulnerablePhysicalFinalRatio",
+        "BuffDamageMonoEnemyVulnerableMagicalFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.monoEnemyVulnerableMagicalFinalRatio",
+        "BuffDamageMonoEnemyVulnerableElementalFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.monoEnemyVulnerableElementalFinalRatio",
+        "BuffDamageMonoEnemyVulnerableElementalFinalRatioSanity": f"{_PREFIX_BUFF_DAMAGE}.monoEnemyVulnerableElementalFinalRatioSanity",
+        "BuffDamageMonoEnemyVulnerableElementalFinalRatioFire": f"{_PREFIX_BUFF_DAMAGE}.monoEnemyVulnerableElementalFinalRatioFire",
+        "BuffDamageMonoEnemyVulnerableElementalFinalRatioDark": f"{_PREFIX_BUFF_DAMAGE}.monoEnemyVulnerableElementalFinalRatioDark",
+        "BuffDamageMonoSkillPointValueAutomatic": f"{_PREFIX_BUFF_DAMAGE}.monoSkillPointValueAutomatic",
+        "BuffDamageMonoSkillPointValueAutomaticCaster": f"{_PREFIX_BUFF_DAMAGE}.monoSkillPointValueAutomaticCaster",
+        "BuffDamageMonoSkillPointValueAutomaticSupporter": f"{_PREFIX_BUFF_DAMAGE}.monoSkillPointValueAutomaticSupporter",
+        "LiteralEnemyRankNormal": f"{_PREFIX_LITERAL}.enemyRankNormal.value",
+        "LiteralEnemyRankElite": f"{_PREFIX_LITERAL}.enemyRankElite.value",
+        "LiteralEnemyRankLeader": f"{_PREFIX_LITERAL}.enemyRankLeader.value",
+
+        "BuffDamageSkillPointSupplyEnablesAutomatic": f"{_PREFIX_BUFF_DAMAGE}.skillPointSupplyEnablesAutomatic",
+        "BuffDamageSkillPointSupplyEnablesOffensive": f"{_PREFIX_BUFF_DAMAGE}.skillPointSupplyEnablesOffensive",
+        "BuffDamageSkillPointSupplyEnablesDefensive": f"{_PREFIX_BUFF_DAMAGE}.skillPointSupplyEnablesDefensive",
+    }
 
 
 _operator_id_regex = r"""
