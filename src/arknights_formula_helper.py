@@ -187,7 +187,7 @@ class Engine:
             minify_policy: "MinifyPolicy",
             io_mode: "IoMode",
         ) -> None:
-        self._visitors = self._get_available_visitors(transform_mode)
+        self._visitors = self._get_available_visitors(transform_mode, io_mode)
         self._transformers = self._get_available_transformers(
             transform_mode, generation_target, minify_policy
         )
@@ -210,12 +210,13 @@ class Engine:
         return "\n".join(results)
 
     def _get_available_visitors(
-            self, transform_mode: "TransformMode"
+            self, transform_mode: "TransformMode", io_mode: "IoMode",
         ) -> Iterable["Visitor"]:
         return [
             OperatorIdValidator(),
             OperatorElementalDamageValidator(),
             AnnotationValidator(transform_mode),
+            RegexValidator(transform_mode, io_mode),
         ]
 
     def _get_available_transformers(
@@ -373,12 +374,14 @@ class Engine:
                     regex="(?P<type>BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)",
                     replacement_provider=(
                         lambda context:
+                            f'{JavaScriptTarget.BASE_ATTACK_MODIFIER_FUNCTION}('
                             f'base.{context.match.group("id")}.'
                             f'{
                                 "summonAttack"
                                 if context.match.group("type") == "BaseSummonAttack"
                                 else "attack"
                             }'
+                            ')'
                     ),
                 ),
             )
@@ -1267,14 +1270,22 @@ class OperatorElementalDamageValidator(Visitor):
         id_pattern = re.compile(_operator_or_summon_id_regex, re.M | re.X)
         matches = re.finditer(id_pattern, formula)
         allow_elemental = False
-        operator_names = []
+        allow_elemental_dark = False
+        allow_elemental_fire = False
+        allow_elemental_sanity = False
+        operator_names = set()
         for match in matches:
             operator_id = match.group("id")
             operator = Operator(operator_id)
-            operator_names.append(operator.name)
+            operator_names.add(operator.name)
             if operator.deal_elemental():
                 allow_elemental = True
-                break
+                if operator.deal_elemental_dark():
+                    allow_elemental_dark = True
+                if operator.deal_elemental_fire():
+                    allow_elemental_fire = True
+                if operator.deal_elemental_sanity():
+                    allow_elemental_sanity = True
         if not allow_elemental:
             patterns = [
                 re.compile(_elemental_damage_regex, re.M | re.X),
@@ -1290,6 +1301,35 @@ class OperatorElementalDamageValidator(Visitor):
                     f"Illegal elemental damage: {", ".join(operator_names)} "
                     f"is not expected to deal elemental damage"
                 )
+        else:
+            patterns = [
+                re.compile(_direct_injury_regex, re.M | re.X),
+                re.compile(_physical_injury_regex, re.M | re.X),
+                re.compile(_magical_injury_regex, re.M | re.X),
+            ]
+            for pattern in patterns:
+                for match in re.finditer(pattern, formula):
+                    injury_type = match.group("injury_type")
+                    if injury_type == "@InjuryDark":
+                        Assert.true(
+                            allow_elemental_dark,
+                            f"Illegal injury type: {", ".join(operator_names)} "
+                            f"is not expected to deal dark injury"
+                        )
+                    elif injury_type == "@InjuryFire":
+                        Assert.true(
+                            allow_elemental_fire,
+                            f"Illegal injury type: {", ".join(operator_names)} "
+                            f"is not expected to deal fire injury"
+                        )
+                    elif injury_type == "@InjurySanity":
+                        Assert.true(
+                            allow_elemental_sanity,
+                            f"Illegal injury type: {", ".join(operator_names)} "
+                            f"is not expected to deal sanity injury"
+                        )
+                    else:
+                        Assert.never()
 
 
 class AnnotationValidator(Visitor):
@@ -1327,6 +1367,81 @@ class AnnotationValidator(Visitor):
             groups = match.groupdict()
             Assert.has_key(groups, "key")
             Assert.has_value(groups, "key", legal_annotations)
+
+
+class RegexValidator(Visitor):
+    def __init__(self, transform_mode: TransformMode, io_mode: IoMode):
+        self._transform_mode = transform_mode
+        self._io_mode = io_mode
+
+    @Assert.override(Visitor)
+    def run(self, formula: str) -> None:
+        # Currently, only transform-from-damage checking is supported
+        if not self._transform_mode.from_damage():
+            return
+
+        def count(regexes: str | Sequence[str]) -> int:
+            if isinstance(regexes, str):
+                regexes = [regexes]
+            return sum([len(re.findall(regex, formula, re.M | re.X)) for regex in regexes])
+        def assert_fail(keyword: str, keyword_count: int, regex_count: int):
+            message = f'Expect number of caught `{keyword}` to be {keyword_count}, got {regex_count}'
+            if self._io_mode == IoMode.FILE:
+                message += f' in formula:\n{formula}'
+            Assert.fail(message)
+        def expect_occur(keyword: str, regexes: Sequence[str]) -> None:
+            keyword_count = count(keyword)
+            regex_count = count(regexes)
+            if keyword_count != regex_count:
+                assert_fail(keyword, keyword_count, regex_count)
+        def expect_multi_occur(keyword: str, regex_with_multipliers: Sequence[tuple[str, int]]) -> None:
+            keyword_count = count(keyword)
+            regex_count = sum([
+                count(regex) * multiplier
+                for regex, multiplier
+                in regex_with_multipliers
+            ])
+            if keyword_count != regex_count:
+                assert_fail(keyword, keyword_count, regex_count)
+        expect_occur(r'BaseAttack', [_operator_id_regex])
+        expect_occur(r'BaseSummonAttack', [_summon_id_regex])
+        expect_multi_occur(r'(?<!0\*)(BaseAttack|BaseSummonAttack)', [
+            (_physical_damage_regex, 2),
+            (_magical_damage_regex, 1),
+            (_true_damage_regex, 1),
+            (_elemental_damage_regex, 1),
+            (_direct_injury_regex, 1),
+            (_physical_injury_regex, 2),
+            (_magical_injury_regex, 1),
+        ])
+        expect_occur(r'"@True"', [_true_damage_regex])
+        expect_occur(r'EnemyDefenseMajor(?!>=)|(?<!>=)EnemyDefenseMinor', [
+            _physical_damage_regex,
+            _physical_injury_regex,
+        ])
+        expect_occur(r'EnemyResistanceMajor(?!>=)|(?<!>=)EnemyResistanceMinor', [
+            _magical_damage_regex,
+            _magical_injury_regex,
+        ])
+        expect_occur(r'EnemyElementalResistanceMajor|EnemyElementalResistanceMinor', [
+            _default_elemental_damage_regex,
+            _elemental_damage_regex,
+        ])
+        expect_occur(r'(EnemyInjuryResistanceMajor|EnemyInjuryResistanceMinor)(?!>0)', [
+            _direct_injury_regex,
+            _physical_injury_regex,
+            _magical_injury_regex,
+        ])
+        expect_multi_occur(r'"@InjuryDark"|"@InjuryFire"|"@InjurySanity"', [
+            (_direct_injury_regex, 1),
+            (_physical_injury_regex, 2),
+            (_magical_injury_regex, 1),
+        ])
+        expect_occur(r'\*30,0', [_attack_span_regex])
+        expect_occur(r'"@AttackSpeed"', [_manual_attack_speed_regex])
+        expect_occur(r'"@SkillAutomatic"', [_skill_automatic_regex])
+        expect_occur(r'"@SkillOffensiveAttackCount"', [_skill_offensive_attack_count_regex])
+        expect_occur(r'"@SkillOffensive"', [_skill_offensive_regex])
 
 
 class Transformer:
@@ -1573,6 +1688,9 @@ class DamageBuffInjector(BuffInjector):
         )
         context.insert(buff, after="attack_final_value")
 
+    def _inject_attack_final_ratio(self, context: MatchContext) -> None:
+        context.insert("*BuffDamageAttackFinalRatio", after="attack_multiplier")
+
     def _get_attack_gain_pass(
         self, damage_type: Literal["physical", "magical", "true", "elemental"]
     ) -> Callable[[MatchContext], None]:
@@ -1589,72 +1707,102 @@ class DamageBuffInjector(BuffInjector):
         self, damage_type: Literal["physical", "magical"], allow_empty: bool = False
     ) -> Callable[[MatchContext], None]:
         if damage_type == "physical":
-            buff = "+BuffDamageEnemyDefenseLossValue"
-            mono_buffs = {
+            loss_value_buff = "+BuffDamageEnemyDefenseLossValue"
+            loss_value_mono_buffs = {
                 "@MonoEnemyStolenDefense": "BuffDamageMonoEnemyStolenDefenseLossValue"
             }
-            final_buff = "*BuffDamageEnemyDefenseLossFinalRatio"
+            loss_ratio_buff = "*BuffDamageEnemyDefenseLossFinalRatio"
+            ignore_value_buff = "+BuffDamageEnemyDefenseIgnoreValue"
+            ignore_ratio_buff = "*BuffDamageEnemyDefenseIgnoreRatio"
             weakener_ungrouped = "defense_ungrouped"
             weakener_loss_value = "defense_loss_value"
             weakener_loss_value_ungrouped = "defense_loss_value_ungrouped"
             weakener_loss_value_empty = "defense_loss_value_empty"
             weakener_loss_ratio = "defense_loss_ratio"
+            weakener_ignoring_value = "defense_ignore_value"
+            weakener_ignoring_value_ungrouped = "defense_ignore_value_ungrouped"
+            weakener_ignoring_value_empty = "defense_ignore_value_empty"
+            weakener_ignoring_ratio = "defense_ignore_ratio"
         elif damage_type == "magical":
-            buff = "+BuffDamageEnemyResistanceLossValue"
-            mono_buffs = {
+            loss_value_buff = "+BuffDamageEnemyResistanceLossValue"
+            loss_value_mono_buffs = {
                 "@MonoEnemyFrozenResistance": "BuffDamageMonoEnemyFrozenResistanceLossValue"
             }
-            final_buff = "*BuffDamageEnemyResistanceLossFinalRatio"
+            loss_ratio_buff = "*BuffDamageEnemyResistanceLossFinalRatio"
+            ignore_value_buff = "+BuffDamageEnemyResistanceIgnoreValue"
+            ignore_ratio_buff = "*BuffDamageEnemyResistanceIgnoreRatio"
             weakener_ungrouped = "resist_ungrouped"
             weakener_loss_value = "resist_loss_value"
             weakener_loss_value_ungrouped = "resist_loss_value_ungrouped"
             weakener_loss_value_empty = "resist_loss_value_empty"
             weakener_loss_ratio = "resist_loss_ratio"
+            weakener_ignoring_value = "resist_ignore_value"
+            weakener_ignoring_value_ungrouped = "resist_ignore_value_ungrouped"
+            weakener_ignoring_value_empty = "resist_ignore_value_empty"
+            weakener_ignoring_ratio = "resist_ignore_ratio"
         else:
             Assert.never()
         def inject_weakener(context: MatchContext) -> None:
+            not_empty_error_message = "Expect weakener to be not empty"
             if context.match.group(weakener_ungrouped) is None:
                 if context.match.group(weakener_loss_value) is not None:
                     self._inject_annotated_buffs(
-                        (AnnotatedBuff(key, value) for key, value in mono_buffs.items()),
+                        (AnnotatedBuff(key, value) for key, value in loss_value_mono_buffs.items()),
                         subpattern_name=weakener_loss_value,
                         context=context,
                     )
-                    context.insert(buff, after=weakener_loss_value)
+                    context.insert(loss_value_buff, after=weakener_loss_value)
                 elif context.match.group(weakener_loss_value_ungrouped) is not None:
                     context.insert('(', before=weakener_loss_value_ungrouped)
-                    for key, value in mono_buffs.items(): 
+                    for key, value in loss_value_mono_buffs.items(): 
                         context.insert(
                             f'+(N("{key}")+MAX({value}))',
                             after=weakener_loss_value_ungrouped
                         )
-                    context.insert(f'{buff})', after=weakener_loss_value_ungrouped)
+                    context.insert(f'{loss_value_buff})', after=weakener_loss_value_ungrouped)
                 elif context.match.group(weakener_loss_value_empty) is not None:
                     context.insert('-(0', after=weakener_loss_value_empty)
-                    for key, value in mono_buffs.items():
+                    for key, value in loss_value_mono_buffs.items():
                         context.insert(
                             f'+(N("{key}")+MAX({value}))',
                             after=weakener_loss_value_empty
                         )
-                    context.insert(f'{buff})', after=weakener_loss_value_empty)
+                    context.insert(f'{loss_value_buff})', after=weakener_loss_value_empty)
                 else:
-                    Assert.true(allow_empty, "Expect weakener to be not empty")
+                    Assert.true(allow_empty, not_empty_error_message)
                 if context.match.group(weakener_loss_ratio) is not None:
-                    context.insert(final_buff, after=weakener_loss_ratio)
+                    context.insert(loss_ratio_buff, after=weakener_loss_ratio)
                 else:
-                    Assert.true(allow_empty, "Expect weakener to be not empty")
+                    Assert.true(allow_empty, not_empty_error_message)
+                if context.match.group(weakener_ignoring_value) is not None:
+                    context.insert(ignore_value_buff, after=weakener_ignoring_value)
+                elif context.match.group(weakener_ignoring_value_ungrouped) is not None:
+                    context.insert('(', before=weakener_ignoring_value_ungrouped)
+                    context.insert(f'{ignore_value_buff})', after=weakener_ignoring_value_ungrouped)
+                elif context.match.group(weakener_ignoring_value_empty) is not None:
+                    context.insert(f'-(0{ignore_value_buff})', after=weakener_ignoring_value_empty)
+                else:
+                    Assert.true(allow_empty, not_empty_error_message)
+                if context.match.group(weakener_ignoring_ratio) is not None:
+                    context.insert(ignore_ratio_buff, after=weakener_ignoring_ratio)
+                else:
+                    Assert.true(allow_empty, not_empty_error_message)
             else:
                 context.insert('MAX(((', before=weakener_ungrouped)
                 context.insert('-(0', after=weakener_ungrouped)
-                for key, value in mono_buffs.items():
+                for key, value in loss_value_mono_buffs.items():
                     context.insert(
                         f'+(N("{key}")+MAX({value}))',
                         after=weakener_ungrouped
                     )
-                context.insert(f'{buff})){final_buff}),0)', after=weakener_ungrouped)
+                context.insert(
+                    f'{loss_value_buff})){loss_ratio_buff}'
+                    f'-(0{ignore_value_buff})){ignore_ratio_buff},0)',
+                    after=weakener_ungrouped
+                )
         return inject_weakener
 
-    def _get_attack_final_ratio_pass(
+    def _get_damage_final_ratio_pass(
         self,
         damage_type: Literal["physical", "magical", "true", "elemental"],
         allow_empty: bool = False,
@@ -1709,7 +1857,7 @@ class DamageBuffInjector(BuffInjector):
                     )
                     mono_buffs[key] = _get_mono_enemy_vulnerable_buff(elemental_type)
             return mono_buffs
-        def _inject_attack_final_ratio(context: MatchContext) -> None:
+        def _inject_damage_final_ratio(context: MatchContext) -> None:
             completed_mono_buffs = _complete_mono_buffs(mono_buffs, context.elemental_type)
             if context.match.group("damage_final_ratio") is not None:
                 self._inject_annotated_buffs(
@@ -1731,7 +1879,7 @@ class DamageBuffInjector(BuffInjector):
                 context.insert(f'{buff})', after="damage_final_ratio_empty")
             else:
                 Assert.true(allow_empty, "Expect damage final ratio to be not empty")
-        return _inject_attack_final_ratio
+        return _inject_damage_final_ratio
 
 
 class PhysicalDamageBuffInjector(DamageBuffInjector):
@@ -1748,10 +1896,11 @@ class PhysicalDamageBuffInjector(DamageBuffInjector):
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
+            self._inject_attack_final_ratio,
             self._get_attack_gain_pass(damage_type="physical"),
             self._inject_physical_line_2,
             self._get_damage_weakener_pass(damage_type="physical"),
-            self._get_attack_final_ratio_pass(damage_type="physical"),
+            self._get_damage_final_ratio_pass(damage_type="physical"),
         ]
 
     @Assert.override(Transformer)
@@ -1812,9 +1961,10 @@ class MagicalDamageBuffInjector(DamageBuffInjector):
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
+            self._inject_attack_final_ratio,
             self._get_attack_gain_pass(damage_type="magical"),
             self._get_damage_weakener_pass(damage_type="magical"),
-            self._get_attack_final_ratio_pass(damage_type="magical"),
+            self._get_damage_final_ratio_pass(damage_type="magical"),
         ]
 
     @Assert.override(Transformer)
@@ -1869,8 +2019,9 @@ class TrueDamageBuffInjector(DamageBuffInjector):
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
+            self._inject_attack_final_ratio,
             self._get_attack_gain_pass(damage_type="true"),
-            self._get_attack_final_ratio_pass(damage_type="true"),
+            self._get_damage_final_ratio_pass(damage_type="true"),
         ]
 
     @Assert.override(Transformer)
@@ -1904,8 +2055,9 @@ class ElementalDamageBuffInjector(DamageBuffInjector):
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
+            self._inject_attack_final_ratio,
             self._get_attack_gain_pass(damage_type="elemental"),
-            self._get_attack_final_ratio_pass(damage_type="elemental"),
+            self._get_damage_final_ratio_pass(damage_type="elemental"),
         ]
 
     @Assert.override(Transformer)
@@ -1937,7 +2089,7 @@ class DefaultElementalDamageBuffInjector(DamageBuffInjector):
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
             self._get_attack_gain_pass(damage_type="elemental"),
-            self._get_attack_final_ratio_pass(damage_type="elemental"),
+            self._get_damage_final_ratio_pass(damage_type="elemental"),
         ]
 
     @Assert.override(Transformer)
@@ -1990,6 +2142,7 @@ class DirectInjuryBuffInjector(InjuryBuffInjector):
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
+            self._inject_attack_final_ratio,
             self._inject_injury_final_ratio,
         ]
 
@@ -2025,9 +2178,10 @@ class PhysicalInjuryBuffInjector(InjuryBuffInjector):
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
+            self._inject_attack_final_ratio,
             self._get_attack_gain_pass(damage_type="physical"),
             self._get_damage_weakener_pass(damage_type="physical"),
-            self._get_attack_final_ratio_pass(damage_type="physical"),
+            self._get_damage_final_ratio_pass(damage_type="physical"),
             self._inject_injury_final_ratio,
         ]
 
@@ -2092,9 +2246,10 @@ class MagicalInjuryBuffInjector(InjuryBuffInjector):
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
+            self._inject_attack_final_ratio,
             self._get_attack_gain_pass(damage_type="magical"),
             self._get_damage_weakener_pass(damage_type="magical"),
-            self._get_attack_final_ratio_pass(damage_type="magical"),
+            self._get_damage_final_ratio_pass(damage_type="magical"),
             self._inject_injury_final_ratio,
         ]
 
@@ -2186,9 +2341,13 @@ class AttackSpanBuffInjector(AttackSpeedBuffInjector):
         context.ensure_subject_exist()
         buff = self._get_attack_speed_buff(context.subject)
         if context.match.group("span_first_value") is not None:
-            context.insert(buff, after="span_first_value")
+            context.insert('MEDIAN(', before="span_first_value")
+            context.insert(f'{buff},20,600)', after="span_first_value")
         else:
-            context.insert(f'/((100{buff})/100)', after="span_first_value_empty")
+            context.insert(
+                f'/(MEDIAN(100{buff},20,600)/100)',
+                after="span_first_value_empty"
+            )
 
 
 class ManualAttackSpeedBuffInjector(AttackSpeedBuffInjector):
@@ -2214,7 +2373,8 @@ class ManualAttackSpeedBuffInjector(AttackSpeedBuffInjector):
     def _inject_attack_speed_first_value(self, context: MatchContext) -> None:
         context.ensure_subject_exist()
         buff = self._get_attack_speed_buff(context.subject)
-        context.insert(buff, after="attack_speed")
+        context.insert('MEDIAN(', before="attack_speed")
+        context.insert(f'{buff},20,600)', after="attack_speed")
 
 
 class AutomaticSkillBuffInjector(BuffInjector):
@@ -3510,6 +3670,7 @@ class Minifier(WholeTransformer):
             self._minify_variables,
             self._minify_annotations,
             self._minify_whitespaces,
+            self._minify_idempotence,
         ]
         for minify in minifiers:
             formula = minify(formula)
@@ -3529,6 +3690,12 @@ class Minifier(WholeTransformer):
 
     def _minify_whitespaces(self, formula: str) -> str:
         return re.sub(pattern=r"\s", repl="", string=formula)
+
+    def _minify_idempotence(self, formula: str) -> str:
+        formula = formula.replace("(0+", "(").replace("(1*", "(")
+        formula = re.sub(pattern=r"\bMAX\(([a-z]+)\)", repl=r"\1", string=formula)
+        formula = re.sub(pattern=r"(?<=[+\-*/(])\(([a-z]+)\)", repl=r"\1", string=formula)
+        return formula
 
     def _should_minify(self, formula: str) -> bool:
         if self._minify_policy == MinifyPolicy.NO_MINIFY:
@@ -3553,6 +3720,7 @@ class Minifier(WholeTransformer):
         "BuffDamageAttackFirstRatioSupporter": "zj",
         "BuffDamageAttackFirstRatioSpecialist": "zk",
         "BuffDamageAttackFirstRatioMelee": "zl",
+        "BuffDamageAttackFinalRatio": "zbk",
         "BuffDamageAttackSpeedFirstValue": "zm",
         "BuffDamageAttackSpeedFirstValueSniper": "zn",
         "BuffDamageAttackSpeedFirstValueMelee": "zo",
@@ -3587,6 +3755,10 @@ class Minifier(WholeTransformer):
         "BuffDamageEnemyDefenseLossFinalRatio": "zaq",
         "BuffDamageEnemyResistanceLossValue": "zar",
         "BuffDamageEnemyResistanceLossFinalRatio": "zas",
+        "BuffDamageEnemyDefenseIgnoreValue": "zbl",
+        "BuffDamageEnemyDefenseIgnoreRatio": "zbm",
+        "BuffDamageEnemyResistanceIgnoreValue": "zbn",
+        "BuffDamageEnemyResistanceIgnoreRatio": "zbo",
         "BuffDamageMonoEncouragedAttackFinalValue": "zat",
         "BuffDamageMonoEnergizedAttackFirstRatio": "zau",
         "BuffDamageMonoEnergizedAttackFirstRatioMelee": "zav",
@@ -3602,7 +3774,7 @@ class Minifier(WholeTransformer):
         "BuffDamageMonoSkillPointValueAutomatic": "zbc",
         "BuffDamageMonoSkillPointValueAutomaticCaster": "zbd",
         "BuffDamageMonoSkillPointValueAutomaticSupporter": "zbe",
-        # last variable abbreviation: zbj
+        # last variable abbreviation: zbo
 
         "EnemyDefenseMajor": "zua",
         "EnemyDefenseMinor": "zub",
@@ -3637,7 +3809,9 @@ class JavaScriptTarget:
     _PREFIX_BUFF = f"{_PREFIX}.buff"
     _PREFIX_BUFF_DAMAGE = f"{_PREFIX_BUFF}.damage"
     _PREFIX_LITERAL = f"{_PREFIX}.literal"
+    _PREFIX_FUNCTION = f"{_PREFIX}.func"
 
+    BASE_ATTACK_MODIFIER_FUNCTION = f"{_PREFIX_FUNCTION}.modifyBaseAttack"
     TRANSLATION_PAIRS = {
         "EnemyDefenseMajor": f"{_PREFIX_ENEMY}.major.defense",
         "EnemyResistanceMajor": f"{_PREFIX_ENEMY}.major.resistance",
@@ -3673,6 +3847,7 @@ class JavaScriptTarget:
         "BuffDamageAttackFirstRatioSupporter": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioSupporter",
         "BuffDamageAttackFirstRatioSpecialist": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioSpecialist",
         "BuffDamageAttackFirstRatioMelee": f"{_PREFIX_BUFF_DAMAGE}.attackFirstRatioMelee",
+        "BuffDamageAttackFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.attackFinalRatio",
         "BuffDamageAttackSpeedFirstValue": f"{_PREFIX_BUFF_DAMAGE}.attackSpeedFirstValue",
         "BuffDamageAttackSpeedFirstValueSniper": f"{_PREFIX_BUFF_DAMAGE}.attackSpeedFirstValueSniper",
         "BuffDamageAttackSpeedFirstValueMelee": f"{_PREFIX_BUFF_DAMAGE}.attackSpeedFirstValueMelee",
@@ -3694,6 +3869,10 @@ class JavaScriptTarget:
         "BuffDamageEnemyDefenseLossFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.enemyDefenseLossFinalRatio",
         "BuffDamageEnemyResistanceLossValue": f"{_PREFIX_BUFF_DAMAGE}.enemyResistanceLossValue",
         "BuffDamageEnemyResistanceLossFinalRatio": f"{_PREFIX_BUFF_DAMAGE}.enemyResistanceLossFinalRatio",
+        "BuffDamageEnemyDefenseIgnoreValue": f"{_PREFIX_BUFF_DAMAGE}.enemyDefenseIgnoreValue",
+        "BuffDamageEnemyDefenseIgnoreRatio": f"{_PREFIX_BUFF_DAMAGE}.enemyDefenseIgnoreRatio",
+        "BuffDamageEnemyResistanceIgnoreValue": f"{_PREFIX_BUFF_DAMAGE}.enemyResistanceIgnoreValue",
+        "BuffDamageEnemyResistanceIgnoreRatio": f"{_PREFIX_BUFF_DAMAGE}.enemyResistanceIgnoreRatio",
         "BuffDamageMonoEncouragedAttackFinalValue": f"{_PREFIX_BUFF_DAMAGE}.monoEncouragedAttackFinalValue",
         "BuffDamageMonoEnergizedAttackFirstRatio": f"{_PREFIX_BUFF_DAMAGE}.monoEnergizedAttackFirstValue",
         "BuffDamageMonoEnergizedAttackFirstRatioMelee": f"{_PREFIX_BUFF_DAMAGE}.monoEnergizedAttackFirstValueMelee",
