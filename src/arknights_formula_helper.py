@@ -1415,7 +1415,7 @@ class RegexValidator(Visitor):
             (_magical_injury_regex, 1),
         ])
         expect_occur(r'"@True"', [_true_damage_regex])
-        expect_occur(r'EnemyDefenseMajor(?!>=)|(?<!>=)EnemyDefenseMinor', [
+        expect_occur(r'(?<!\+)EnemyDefenseMajor(?!>=)|(?<!>=)(?<!\+)EnemyDefenseMinor', [
             _physical_damage_regex,
             _physical_injury_regex,
         ])
@@ -1656,6 +1656,8 @@ class DamageBuffInjector(BuffInjector):
         buff = '+BuffDamageAttackFirstRatio'
         if context.subject.is_melee():
             buff += '+BuffDamageAttackFirstRatioMelee'
+        elif context.subject.is_ranged():
+            buff += '+BuffDamageAttackFirstRatioRanged'
         if context.subject.is_operator():
             profession = context.subject.get_profession()
             buff += f'+BuffDamageAttackFirstRatio{profession}'
@@ -3720,6 +3722,7 @@ class Minifier(WholeTransformer):
         "BuffDamageAttackFirstRatioSupporter": "zj",
         "BuffDamageAttackFirstRatioSpecialist": "zk",
         "BuffDamageAttackFirstRatioMelee": "zl",
+        "BuffDamageAttackFirstRatioRanged": "zbp",
         "BuffDamageAttackFinalRatio": "zbk",
         "BuffDamageAttackSpeedFirstValue": "zm",
         "BuffDamageAttackSpeedFirstValueSniper": "zn",
@@ -3774,7 +3777,7 @@ class Minifier(WholeTransformer):
         "BuffDamageMonoSkillPointValueAutomatic": "zbc",
         "BuffDamageMonoSkillPointValueAutomaticCaster": "zbd",
         "BuffDamageMonoSkillPointValueAutomaticSupporter": "zbe",
-        # last variable abbreviation: zbo
+        # last variable abbreviation: zbp
 
         "EnemyDefenseMajor": "zua",
         "EnemyDefenseMinor": "zub",
@@ -3840,6 +3843,7 @@ class JavaScriptTarget:
         "BuffDamageAttackFirstRatioSupporter": "controlBuffDamageAttackFirstRatioSupporter",
         "BuffDamageAttackFirstRatioSpecialist": "controlBuffDamageAttackFirstRatioSpecialist",
         "BuffDamageAttackFirstRatioMelee": "controlBuffDamageAttackFirstRatioMelee",
+        "BuffDamageAttackFirstRatioRanged": "controlBuffDamageAttackFirstRatioRanged",
         "BuffDamageAttackFinalRatio": "controlBuffDamageAttackFinalRatio",
         "BuffDamageAttackSpeedFirstValue": "controlBuffDamageAttackSpeedFirstValue",
         "BuffDamageAttackSpeedFirstValueSniper": "controlBuffDamageAttackSpeedFirstValueSniper",
@@ -4030,7 +4034,7 @@ _magical_damage_regex = r"""
       )*)
     \s*\)
     (?P<attack_multiplier>(?:\*[0-9.]+)*)
-    (?P<attack_gain>(?:\+[0-9.]+)*)
+    (?P<attack_gain>(?:\+[0-9.]+|\+(?:EnemyDefenseMajor|EnemyDefenseMinor)(?:\*[0-9.]+)?)*)
   \s*\)
 )
 \*\(\s*MEDIAN
