@@ -191,17 +191,21 @@ class Engine:
         self._transformers = self._get_available_transformers(
             transform_mode, generation_target, minify_policy
         )
+        self._transform_mode = transform_mode
         self._io_mode = io_mode
 
-    def run(self, formula: str) -> str:
+    def run(self, formula: str, poke: Optional[str] = None) -> str:
         start_time = time.perf_counter()
         results = []
+        pokers = self._get_available_pokers(poke_literal=poke)
         sub_formulas = self._split(formula)
         for sub_formula in sub_formulas:
             if len(sub_formula) > 0:
                 sub_formula = self._unescape(sub_formula)
                 for visitor in self._visitors:
                     visitor.run(sub_formula)
+                for poker in pokers:
+                    sub_formula = poker.run(sub_formula)
                 for transformer in self._transformers:
                     sub_formula = transformer.run(sub_formula)
             results.append(sub_formula)
@@ -218,6 +222,23 @@ class Engine:
             AnnotationValidator(transform_mode),
             RegexValidator(transform_mode, io_mode),
         ]
+
+    def _get_available_pokers(self, poke_literal: Optional[str]) -> Iterable["Poker"]:
+        if poke_literal is None:
+            return []
+        else:
+            Assert.true(
+                self._transform_mode.from_damage(),
+                "Poking is only supported when transforming from damage"
+            )
+            return [
+                PrePokerSubjectInjector(),
+                PhysicalDamagePoker(poke_literal),
+                MagicalDamagePoker(poke_literal),
+                TrueDamagePoker(poke_literal),
+                ElementalDamagePoker(poke_literal),
+                DefaultElementalDamagePoker(poke_literal),
+            ]
 
     def _get_available_transformers(
             self,
@@ -1415,7 +1436,7 @@ class RegexValidator(Visitor):
             (_magical_injury_regex, 1),
         ])
         expect_occur(r'"@True"', [_true_damage_regex])
-        expect_occur(r'(?<!\+)EnemyDefenseMajor(?!>=)|(?<!>=)(?<!\+)EnemyDefenseMinor', [
+        expect_occur(r'(?<!\+)EnemyDefenseMajor(?!=|>|<)|(?<!=|>|<)(?<!\+)EnemyDefenseMinor', [
             _physical_damage_regex,
             _physical_injury_regex,
         ])
@@ -3352,7 +3373,7 @@ class LetBindingTranslator(Transformer):
 
     @Assert.override(Transformer)
     def _ensure_valid(self, match: re.Match) -> None:
-        return True
+        return
 
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
@@ -3425,7 +3446,7 @@ class LetBindingTranslator(Transformer):
                                 # variable definition ends at this line
                                 definition_index = line_end_index
                                 break
-                        elif ord('A') <= ord(next_line[0]) <= ord('Z'):
+                        elif (ord('A') <= ord(next_line[0]) <= ord('Z')) or next_line[0] == "_":
                             # new variable at next line
                             # variable definition ends at this line
                             definition_index = line_end_index
@@ -3628,6 +3649,88 @@ class EqualSignTranslator(WholeTransformer):
                 allow_shorten=True
             )
         ]
+
+
+class Poker(Transformer):
+    def __init__(self, poke_literal: str):
+        self._poke_literal = poke_literal
+        super().__init__()
+
+    @Assert.override(Transformer)
+    def _ensure_valid(self, match: re.Match) -> None:
+        return
+
+    @Assert.override(Transformer)
+    def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
+        return [
+            self._poke
+        ]
+
+    def _poke(self, context: MatchContext) -> None:
+        if context.get_all() != self._poke_literal:
+            start, end = context.match.start(), context.match.end()
+            context.replace_by_index("0", start, end, allow_shorten=True)
+
+
+class PhysicalDamagePoker(Poker):
+    def __init__(self, poke_literal: str):
+        super().__init__(poke_literal)
+
+    @Assert.override(Transformer)
+    def _get_pattern(self) -> re.Pattern:
+        return re.compile(_physical_damage_regex, re.M | re.X)
+
+
+class MagicalDamagePoker(Poker):
+    def __init__(self, poke_literal: str):
+        super().__init__(poke_literal)
+
+    @Assert.override(Transformer)
+    def _get_pattern(self) -> re.Pattern:
+        return re.compile(_magical_damage_regex, re.M | re.X)
+
+
+class TrueDamagePoker(Poker):
+    def __init__(self, poke_literal: str):
+        super().__init__(poke_literal)
+
+    @Assert.override(Transformer)
+    def _get_pattern(self) -> re.Pattern:
+        return re.compile(_true_damage_regex, re.M | re.X)
+
+
+class ElementalDamagePoker(Poker):
+    def __init__(self, poke_literal: str):
+        super().__init__(poke_literal)
+
+    @Assert.override(Transformer)
+    def _get_pattern(self) -> re.Pattern:
+        return re.compile(_elemental_damage_regex, re.M | re.X)
+
+
+class DefaultElementalDamagePoker(Poker):
+    def __init__(self, poke_literal: str):
+        super().__init__(poke_literal)
+
+    @Assert.override(Transformer)
+    def _get_pattern(self) -> re.Pattern:
+        return re.compile(_default_elemental_damage_regex, re.M | re.X)
+
+
+class PrePokerSubjectInjector(WholeTransformer):
+    @Assert.override(Transformer)
+    def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
+        return [
+            self._inject_subject,
+        ]
+
+    def _inject_subject(self, context: MatchContext) -> None:
+        prefix = ""
+        for operator in context.operators:
+            prefix += f"0*BaseAttack{operator.identifier}+"
+        for summon in context.summons:
+            prefix += f"0*BaseSummonAttack{summon.identifier}+"
+        context.replace(f"={prefix}{context.get_all()[1:]}", subpattern_name="all")
 
 
 class Minifier(WholeTransformer):
@@ -4044,7 +4147,10 @@ _magical_damage_regex = r"""
         \(\s*
           (?:EnemyResistanceMajor|EnemyResistanceMinor)
           (?:
-            -\(\s*(?P<resist_loss_value>[0-9.]+(?:\+[0-9.]+)*)\s*\)
+            -\(\s*(?P<resist_loss_value>
+              (?:[0-9.]+|\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))
+              (?:\+[0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\))*
+            )\s*\)
             |
             -(?P<resist_loss_value_ungrouped>[0-9.]+(?:\+[0-9.]+)*)
             |
