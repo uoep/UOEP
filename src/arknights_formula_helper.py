@@ -3903,7 +3903,7 @@ class Minifier(WholeTransformer):
         "BaseAttackLT40X": "zxa",
         "BaseAttackRE03D": "zxb",
         "BaseAttackLN11D": "zxc",
-        "BaseAttackNM06": "zxd",
+        # "BaseAttackNM06": "zxd",  # name removed
     }
 
     _auto_variables = ()
