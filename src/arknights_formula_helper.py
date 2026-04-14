@@ -719,7 +719,7 @@ class FormulaContext:
         old_length = end - start
         new_length = len(text)
         aligned_start, aligned_end = self.peek((start, end))
-        self._shift(start, new_length - old_length, allow_shorten)
+        self._shift(start + 1, new_length - old_length, allow_shorten)
         self._formula = self._formula[:aligned_start] + text + self._formula[aligned_end:]
         if _DEBUG:
             print(f"Replace with `{text}` at {start}:{end}")
@@ -1369,7 +1369,7 @@ class AnnotationValidator(Visitor):
                 "@MonoSkillPointAutomatic",
                 "@True", "@InjurySanity", "@InjuryFire", "@InjuryDark",
                 "@SkillOffensiveAttackCount", "@AttackSpeed", "@SkillAutomatic",
-                "@SkillOffensive",
+                "@SkillOffensive", "@NoBuff",
             ])
         elif self._transform_mode.from_endurance():
             self._ensure_legal(formula, legal_annotations=[
@@ -1669,8 +1669,16 @@ class DamageBuffInjector(BuffInjector):
     def __init__(self):
         super().__init__()
 
+    def _inject_pre_max_3_bracket(self, context: MatchContext) -> None:
+        context.replace("MAX(", subpattern_name="attack_bracket_1")
+        context.replace("MAX(", subpattern_name="attack_bracket_2")
+        context.replace("MAX(", subpattern_name="attack_bracket_3")
+
+    def _inject_pre_max_1_bracket(self, context: MatchContext) -> None:
+        context.replace("MAX(", subpattern_name="attack_bracket")
+
     def _inject_attack_first_value(self, context: MatchContext) -> None:
-        context.insert("+BuffDamageAttackFirstValue", after="attack_first_value")
+        context.insert("+BuffDamageAttackFirstValue,0", after="attack_first_value")
 
     def _inject_attack_first_ratio(self, context: MatchContext) -> None:
         context.ensure_subject_exist()
@@ -1689,15 +1697,16 @@ class DamageBuffInjector(BuffInjector):
             else 'BuffDamageMonoEnergizedAttackFirstRatio'
         )
         if context.match.group("attack_first_ratio") is not None:
+            context.replace("MAX(", subpattern_name="attack_first_ratio_bracket")
             self._inject_annotated_buffs(
                 AnnotatedBuff("@MonoEnergizedAttack", mono_buff),
                 subpattern_name="attack_first_ratio",
                 context=context,
             )
-            context.insert(buff, after="attack_first_ratio")
+            context.insert(f'{buff},0', after="attack_first_ratio")
         else:
             context.insert(
-                f'*(1+(N("@MonoEnergizedAttack")+MAX({mono_buff})){buff})',
+                f'*MAX(1+(N("@MonoEnergizedAttack")+MAX({mono_buff})){buff},0)',
                 after="attack_first_ratio_empty"
             )
 
@@ -1709,7 +1718,7 @@ class DamageBuffInjector(BuffInjector):
             subpattern_name="attack_final_value",
             context=context,
         )
-        context.insert(buff, after="attack_final_value")
+        context.insert(f'{buff},0', after="attack_final_value")
 
     def _inject_attack_final_ratio(self, context: MatchContext) -> None:
         context.insert("*BuffDamageAttackFinalRatio", after="attack_multiplier")
@@ -1724,10 +1733,11 @@ class DamageBuffInjector(BuffInjector):
             "elemental": "+BuffDamageElementalGainValue",
         }
         Assert.true(damage_type in buffs, f"Illegal damage_type `{damage_type}`")
-        return lambda context: context.insert(buffs[damage_type], after="attack_gain")
+        buff = buffs[damage_type]
+        return lambda context: context.insert(f'{buff},0', after="attack_gain")
 
     def _get_damage_weakener_pass(
-        self, damage_type: Literal["physical", "magical"], allow_empty: bool = False
+        self, damage_type: Literal["physical", "magical"]
     ) -> Callable[[MatchContext], None]:
         if damage_type == "physical":
             loss_value_buff = "+BuffDamageEnemyDefenseLossValue"
@@ -1737,6 +1747,10 @@ class DamageBuffInjector(BuffInjector):
             loss_ratio_buff = "*BuffDamageEnemyDefenseLossFinalRatio"
             ignore_value_buff = "+BuffDamageEnemyDefenseIgnoreValue"
             ignore_ratio_buff = "*BuffDamageEnemyDefenseIgnoreRatio"
+            inner_limit_exist = False
+            inner_limit_group = None
+            inner_limit_prefix = ""
+            inner_limit_suffix = ""
             weakener_ungrouped = "defense_ungrouped"
             weakener_loss_value = "defense_loss_value"
             weakener_loss_value_ungrouped = "defense_loss_value_ungrouped"
@@ -1754,6 +1768,10 @@ class DamageBuffInjector(BuffInjector):
             loss_ratio_buff = "*BuffDamageEnemyResistanceLossFinalRatio"
             ignore_value_buff = "+BuffDamageEnemyResistanceIgnoreValue"
             ignore_ratio_buff = "*BuffDamageEnemyResistanceIgnoreRatio"
+            inner_limit_exist = True
+            inner_limit_group = "resist_bracket"
+            inner_limit_prefix = "MIN("
+            inner_limit_suffix = ",100)"
             weakener_ungrouped = "resist_ungrouped"
             weakener_loss_value = "resist_loss_value"
             weakener_loss_value_ungrouped = "resist_loss_value_ungrouped"
@@ -1766,8 +1784,9 @@ class DamageBuffInjector(BuffInjector):
         else:
             Assert.never()
         def inject_weakener(context: MatchContext) -> None:
-            not_empty_error_message = "Expect weakener to be not empty"
             if context.match.group(weakener_ungrouped) is None:
+                if inner_limit_exist:
+                    context.insert(inner_limit_prefix, before=inner_limit_group)
                 if context.match.group(weakener_loss_value) is not None:
                     self._inject_annotated_buffs(
                         (AnnotatedBuff(key, value) for key, value in loss_value_mono_buffs.items()),
@@ -1792,11 +1811,10 @@ class DamageBuffInjector(BuffInjector):
                         )
                     context.insert(f'{loss_value_buff})', after=weakener_loss_value_empty)
                 else:
-                    Assert.true(allow_empty, not_empty_error_message)
-                if context.match.group(weakener_loss_ratio) is not None:
-                    context.insert(loss_ratio_buff, after=weakener_loss_ratio)
-                else:
-                    Assert.true(allow_empty, not_empty_error_message)
+                    Assert.never()
+                context.insert(loss_ratio_buff, after=weakener_loss_ratio)
+                if inner_limit_exist:
+                    context.insert(inner_limit_suffix, after=weakener_loss_ratio)
                 if context.match.group(weakener_ignoring_value) is not None:
                     context.insert(ignore_value_buff, after=weakener_ignoring_value)
                 elif context.match.group(weakener_ignoring_value_ungrouped) is not None:
@@ -1805,13 +1823,10 @@ class DamageBuffInjector(BuffInjector):
                 elif context.match.group(weakener_ignoring_value_empty) is not None:
                     context.insert(f'-(0{ignore_value_buff})', after=weakener_ignoring_value_empty)
                 else:
-                    Assert.true(allow_empty, not_empty_error_message)
-                if context.match.group(weakener_ignoring_ratio) is not None:
-                    context.insert(ignore_ratio_buff, after=weakener_ignoring_ratio)
-                else:
-                    Assert.true(allow_empty, not_empty_error_message)
+                    Assert.never()
+                context.insert(ignore_ratio_buff, after=weakener_ignoring_ratio)
             else:
-                context.insert('MAX(((', before=weakener_ungrouped)
+                context.insert(f'MAX(({inner_limit_prefix}(', before=weakener_ungrouped)
                 context.insert('-(0', after=weakener_ungrouped)
                 for key, value in loss_value_mono_buffs.items():
                     context.insert(
@@ -1819,7 +1834,7 @@ class DamageBuffInjector(BuffInjector):
                         after=weakener_ungrouped
                     )
                 context.insert(
-                    f'{loss_value_buff})){loss_ratio_buff}'
+                    f'{loss_value_buff})){loss_ratio_buff}{inner_limit_suffix}'
                     f'-(0{ignore_value_buff})){ignore_ratio_buff},0)',
                     after=weakener_ungrouped
                 )
@@ -1883,16 +1898,17 @@ class DamageBuffInjector(BuffInjector):
         def _inject_damage_final_ratio(context: MatchContext) -> None:
             completed_mono_buffs = _complete_mono_buffs(mono_buffs, context.elemental_type)
             if context.match.group("damage_final_ratio") is not None:
-                self._inject_annotated_buffs(
-                    (
-                        AnnotatedBuff(key, value)
-                        for key, value in completed_mono_buffs.items()
-                    ),
-                    separator="*",
-                    subpattern_name="damage_final_ratio",
-                    context=context,
-                )
-                context.insert(buff, after="damage_final_ratio")
+                if 'N("@NoBuff")' not in context.get("damage_final_ratio"):
+                    self._inject_annotated_buffs(
+                        (
+                            AnnotatedBuff(key, value)
+                            for key, value in completed_mono_buffs.items()
+                        ),
+                        separator="*",
+                        subpattern_name="damage_final_ratio",
+                        context=context,
+                    )
+                    context.insert(buff, after="damage_final_ratio")
             elif context.match.group("damage_final_ratio_empty") is not None:
                 context.insert('*(1', after="damage_final_ratio_empty")
                 for key, value in completed_mono_buffs.items():
@@ -1916,6 +1932,7 @@ class PhysicalDamageBuffInjector(DamageBuffInjector):
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
+            self._inject_pre_max_3_bracket,
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
@@ -1930,7 +1947,8 @@ class PhysicalDamageBuffInjector(DamageBuffInjector):
     def _ensure_valid(self, match: re.Match) -> None:
         groups = match.groupdict()
         Assert.has_key(groups, [
-            "physical_line_1", "id", "attack_first_value", "attack_first_ratio",
+            "physical_line_1", "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+            "id", "attack_first_value", "attack_first_ratio_bracket", "attack_first_ratio",
             "attack_first_ratio_empty", "attack_final_value", "attack_multiplier",
             "attack_gain", "physical_line_2", "defense_loss_value",
             "defense_loss_value_ungrouped", "defense_loss_value_empty",
@@ -1943,9 +1961,18 @@ class PhysicalDamageBuffInjector(DamageBuffInjector):
             "attack_first_value", "attack_final_value", 
             "attack_multiplier", "attack_gain",
         ])
-        Assert.not_empty(groups, ["physical_line_1", "physical_line_2", "id"])
+        Assert.not_empty(groups, [
+            "physical_line_1", "physical_line_2", "id",
+            "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+        ])
         Assert.equal(groups, "physical_line_1", "physical_line_2")
-        Assert.either(groups, ["attack_first_ratio", "attack_first_ratio_empty"])
+        Assert.true(
+            (
+                Check.not_empty(groups, "attack_first_ratio_bracket") and
+                Check.not_empty(groups, "attack_first_ratio")
+            ) or (
+                Check.not_none(groups, "attack_first_ratio_empty")
+            ), error="Sanity check failed", groups=groups)
         Assert.true(
             (
                 Check.not_none(groups, "defense_ungrouped")
@@ -1981,6 +2008,7 @@ class MagicalDamageBuffInjector(DamageBuffInjector):
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
+            self._inject_pre_max_3_bracket,
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
@@ -1994,9 +2022,10 @@ class MagicalDamageBuffInjector(DamageBuffInjector):
     def _ensure_valid(self, match: re.Match) -> None:
         groups = match.groupdict()
         Assert.has_key(groups, [
-            "magical_main", "id", "attack_first_value", "attack_first_ratio",
+            "magical_main", "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+            "id", "attack_first_value", "attack_first_ratio_bracket", "attack_first_ratio",
             "attack_first_ratio_empty", "attack_final_value", "attack_multiplier",
-            "attack_gain", "resist_loss_value", "resist_loss_value_ungrouped",
+            "attack_gain", "resist_bracket", "resist_loss_value", "resist_loss_value_ungrouped",
             "resist_loss_value_empty", "resist_loss_ratio", "resist_ignore_value",
             "resist_ignore_value_ungrouped", "resist_ignore_value_empty", 
             "resist_ignore_ratio", "resist_ungrouped", "damage_final_ratio",
@@ -2006,10 +2035,20 @@ class MagicalDamageBuffInjector(DamageBuffInjector):
             "attack_first_value", "attack_final_value",
             "attack_multiplier", "attack_gain"
         ])
-        Assert.not_empty(groups, ["magical_main", "id"])
-        Assert.either(groups, ["attack_first_ratio", "attack_first_ratio_empty"])
+        Assert.not_empty(groups, [
+            "magical_main", "id",
+            "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+        ])
         Assert.true(
             (
+                Check.not_empty(groups, "attack_first_ratio_bracket") and
+                Check.not_empty(groups, "attack_first_ratio")
+            ) or (
+                Check.not_none(groups, "attack_first_ratio_empty")
+            ), error="Sanity check failed", groups=groups)
+        Assert.true(
+            (
+                Check.not_empty(groups, "resist_bracket") and
                 Check.not_none(groups, "resist_loss_ratio") and
                 Check.either(groups, [
                     "resist_loss_value",
@@ -2039,6 +2078,7 @@ class TrueDamageBuffInjector(DamageBuffInjector):
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
+            self._inject_pre_max_3_bracket,
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
@@ -2051,7 +2091,8 @@ class TrueDamageBuffInjector(DamageBuffInjector):
     def _ensure_valid(self, match: re.Match) -> None:
         groups = match.groupdict()
         Assert.has_key(groups, [
-            "true_main", "id", "attack_first_value", "attack_first_ratio",
+            "true_main", "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+            "id", "attack_first_value", "attack_first_ratio_bracket", "attack_first_ratio",
             "attack_first_ratio_empty", "attack_final_value", "attack_multiplier",
             "attack_gain", "damage_final_ratio", "damage_final_ratio_empty",
         ])
@@ -2059,8 +2100,17 @@ class TrueDamageBuffInjector(DamageBuffInjector):
             "attack_first_value", "attack_final_value",
             "attack_multiplier", "attack_gain"
         ])
-        Assert.not_empty(groups, ["true_main", "id"])
-        Assert.either(groups, ["attack_first_ratio", "attack_first_ratio_empty"])
+        Assert.not_empty(groups, [
+            "true_main", "id",
+            "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+        ])
+        Assert.true(
+            (
+                Check.not_empty(groups, "attack_first_ratio_bracket") and
+                Check.not_empty(groups, "attack_first_ratio")
+            ) or (
+                Check.not_none(groups, "attack_first_ratio_empty")
+            ), error="Sanity check failed", groups=groups)
         Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
 
 
@@ -2075,6 +2125,7 @@ class ElementalDamageBuffInjector(DamageBuffInjector):
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
+            self._inject_pre_max_3_bracket,
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
@@ -2087,7 +2138,8 @@ class ElementalDamageBuffInjector(DamageBuffInjector):
     def _ensure_valid(self, match: re.Match) -> None:
         groups = match.groupdict()
         Assert.has_key(groups, [
-            "elemental_main", "id", "attack_first_value", "attack_first_ratio",
+            "elemental_main", "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+            "id", "attack_first_value", "attack_first_ratio_bracket", "attack_first_ratio",
             "attack_first_ratio_empty", "attack_final_value", "attack_multiplier",
             "attack_gain", "damage_final_ratio", "damage_final_ratio_empty",
         ])
@@ -2095,8 +2147,17 @@ class ElementalDamageBuffInjector(DamageBuffInjector):
             "attack_first_value", "attack_final_value",
             "attack_multiplier", "attack_gain"
         ])
-        Assert.not_empty(groups, ["elemental_main", "id"])
-        Assert.either(groups, ["attack_first_ratio", "attack_first_ratio_empty"])
+        Assert.not_empty(groups, [
+            "elemental_main", "id",
+            "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+        ])
+        Assert.true(
+            (
+                Check.not_empty(groups, "attack_first_ratio_bracket") and
+                Check.not_empty(groups, "attack_first_ratio")
+            ) or (
+                Check.not_none(groups, "attack_first_ratio_empty")
+            ), error="Sanity check failed", groups=groups)
         Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
 
 
@@ -2111,6 +2172,7 @@ class DefaultElementalDamageBuffInjector(DamageBuffInjector):
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
+            self._inject_pre_max_1_bracket,
             self._get_attack_gain_pass(damage_type="elemental"),
             self._get_damage_final_ratio_pass(damage_type="elemental"),
         ]
@@ -2119,11 +2181,12 @@ class DefaultElementalDamageBuffInjector(DamageBuffInjector):
     def _ensure_valid(self, match: re.Match) -> None:
         groups = match.groupdict()
         Assert.has_key(groups, [
-            "default_elemental_main", "default_sanity", "default_fire", "default_dark",
+            "default_elemental_main", "attack_bracket",
+            "default_sanity", "default_fire", "default_dark",
             "attack_gain", "damage_final_ratio", "damage_final_ratio_empty",
         ])
         Assert.not_none(groups, ["attack_gain"])
-        Assert.not_empty(groups, ["default_elemental_main"])
+        Assert.not_empty(groups, ["default_elemental_main", "attack_bracket"])
         Assert.either(groups, ["default_sanity", "default_fire", "default_dark"])
         Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
 
@@ -2162,6 +2225,7 @@ class DirectInjuryBuffInjector(InjuryBuffInjector):
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
+            self._inject_pre_max_3_bracket,
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
@@ -2173,8 +2237,9 @@ class DirectInjuryBuffInjector(InjuryBuffInjector):
     def _ensure_valid(self, match: re.Match) -> None:
         groups = match.groupdict()
         Assert.has_key(groups, [
-            "injury_main", "injury_type", "id", "attack_first_value",
-            "attack_first_ratio", "attack_first_ratio_empty",
+            "injury_main", "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+            "injury_type", "id", "attack_first_value",
+            "attack_first_ratio_bracket", "attack_first_ratio", "attack_first_ratio_empty",
             "attack_final_value", "attack_multiplier", "attack_gain",
             "injury_final_ratio", "injury_final_ratio_empty",
         ])
@@ -2182,8 +2247,17 @@ class DirectInjuryBuffInjector(InjuryBuffInjector):
             "attack_first_value", "attack_final_value",
             "attack_multiplier", "attack_gain",
         ])
-        Assert.not_empty(groups, ["injury_main", "injury_type", "id"])
-        Assert.either(groups, ["attack_first_ratio", "attack_first_ratio_empty"])
+        Assert.not_empty(groups, [
+            "injury_main", "injury_type", "id",
+            "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+        ])
+        Assert.true(
+            (
+                Check.not_empty(groups, "attack_first_ratio_bracket") and
+                Check.not_empty(groups, "attack_first_ratio")
+            ) or (
+                Check.not_none(groups, "attack_first_ratio_empty")
+            ), error="Sanity check failed", groups=groups)
         Assert.either(groups, ["injury_final_ratio", "injury_final_ratio_empty"])
 
 
@@ -2198,11 +2272,13 @@ class PhysicalInjuryBuffInjector(InjuryBuffInjector):
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
+            self._inject_pre_max_3_bracket,
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
             self._inject_attack_final_ratio,
             self._get_attack_gain_pass(damage_type="physical"),
+            self._inject_physical_line_2,
             self._get_damage_weakener_pass(damage_type="physical"),
             self._get_damage_final_ratio_pass(damage_type="physical"),
             self._inject_injury_final_ratio,
@@ -2212,8 +2288,9 @@ class PhysicalInjuryBuffInjector(InjuryBuffInjector):
     def _ensure_valid(self, match: re.Match) -> None:
         groups = match.groupdict()
         Assert.has_key(groups, [
-            "physical_line_1", "injury_type",
-            "id", "attack_first_value", "attack_first_ratio",
+            "physical_line_1", "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+            "injury_type", "id", "attack_first_value", 
+            "attack_first_ratio_bracket", "attack_first_ratio",
             "attack_first_ratio_empty", "attack_final_value", "attack_multiplier",
             "attack_gain", "physical_line_2", "defense_loss_value",
             "defense_loss_value_ungrouped", "defense_loss_value_empty",
@@ -2231,9 +2308,16 @@ class PhysicalInjuryBuffInjector(InjuryBuffInjector):
         ])
         Assert.not_empty(groups, [
             "physical_line_1", "physical_line_2", "injury_type", "id",
+            "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
         ])
         Assert.equal(groups, "physical_line_1", "physical_line_2")
-        Assert.either(groups, ["attack_first_ratio", "attack_first_ratio_empty"])
+        Assert.true(
+            (
+                Check.not_empty(groups, "attack_first_ratio_bracket") and
+                Check.not_empty(groups, "attack_first_ratio")
+            ) or (
+                Check.not_none(groups, "attack_first_ratio_empty")
+            ), error="Sanity check failed", groups=groups)
         Assert.true(
             (
                 Check.not_none(groups, "defense_ungrouped")
@@ -2254,6 +2338,10 @@ class PhysicalInjuryBuffInjector(InjuryBuffInjector):
         Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
         Assert.either(groups, ["injury_final_ratio", "injury_final_ratio_empty"])
 
+    def _inject_physical_line_2(self, context: MatchContext) -> None:
+        source_text = context.get("physical_line_1")
+        context.replace(text=source_text, subpattern_name="physical_line_2")
+
 
 class MagicalInjuryBuffInjector(InjuryBuffInjector):
     def __init__(self):
@@ -2266,6 +2354,7 @@ class MagicalInjuryBuffInjector(InjuryBuffInjector):
     @Assert.override(Transformer)
     def _get_passes(self) -> Iterable[Callable[[MatchContext], None]]:
         return [
+            self._inject_pre_max_3_bracket,
             self._inject_attack_first_value,
             self._inject_attack_first_ratio,
             self._inject_attack_final_value,
@@ -2280,9 +2369,10 @@ class MagicalInjuryBuffInjector(InjuryBuffInjector):
     def _ensure_valid(self, match: re.Match) -> None:
         groups = match.groupdict()
         Assert.has_key(groups, [
-            "injury_main", "injury_type", "id", "attack_first_value",
+            "injury_main", "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+            "injury_type", "id", "attack_first_value", "attack_first_ratio_bracket",
             "attack_first_ratio", "attack_first_ratio_empty", "attack_final_value",
-            "attack_multiplier", "attack_gain", "resist_loss_value",
+            "attack_multiplier", "attack_gain", "resist_bracket", "resist_loss_value",
             "resist_loss_value_ungrouped", "resist_loss_value_empty",
             "resist_loss_ratio", "resist_ignore_value", "resist_ignore_value_ungrouped",
             "resist_ignore_value_empty", "resist_ignore_ratio", "resist_ungrouped",
@@ -2295,10 +2385,20 @@ class MagicalInjuryBuffInjector(InjuryBuffInjector):
             "attack_multiplier", "attack_gain",
             "magical_injury_multiplier",
         ])
-        Assert.not_empty(groups, ["injury_main", "injury_type", "id"])
-        Assert.either(groups, ["attack_first_ratio", "attack_first_ratio_empty"])
+        Assert.not_empty(groups, [
+            "injury_main", "injury_type", "id",
+            "attack_bracket_1", "attack_bracket_2", "attack_bracket_3",
+        ])
         Assert.true(
             (
+                Check.not_empty(groups, "attack_first_ratio_bracket") and
+                Check.not_empty(groups, "attack_first_ratio")
+            ) or (
+                Check.not_none(groups, "attack_first_ratio_empty")
+            ), error="Sanity check failed", groups=groups)
+        Assert.true(
+            (
+                Check.not_empty(groups, "resist_bracket") and
                 Check.not_none(groups, "resist_loss_ratio") and
                 Check.either(groups, [
                     "resist_loss_value",
@@ -3776,6 +3876,8 @@ class Minifier(WholeTransformer):
             self._minify_annotations,
             self._minify_whitespaces,
             self._minify_idempotence,
+            self._minify_arithmetics,
+            self._minify_idempotence,
         ]
         for minify in minifiers:
             formula = minify(formula)
@@ -3800,6 +3902,26 @@ class Minifier(WholeTransformer):
         formula = formula.replace("(0+", "(").replace("(1*", "(")
         formula = re.sub(pattern=r"\bMAX\(([a-z]+)\)", repl=r"\1", string=formula)
         formula = re.sub(pattern=r"(?<=[+\-*/(])\(([a-z]+)\)", repl=r"\1", string=formula)
+        return formula
+
+    def _minify_arithmetics(self, formula: str) -> str:
+        pattern = r'\(([\d.]+)\+([\d.]+)([+)])'
+        while True:
+            answer_map = {}
+            for match in re.finditer(pattern, formula):
+                unit = match.group()
+                lhs = match.group(1)
+                rhs = match.group(2)
+                close = match.group(3)
+                convert = float if ('.' in lhs) or ('.' in rhs) else int
+                lhs_precision = len(lhs.split('.')[1]) if '.' in lhs else 0
+                rhs_precision = len(rhs.split('.')[1]) if '.' in rhs else 0
+                answer = round(convert(lhs) + convert(rhs), max(lhs_precision, rhs_precision))
+                answer_map[unit] = f'({answer}{close}'
+            if len(answer_map) == 0:
+                break
+            for arithmetic, answer in answer_map.items():
+                formula = formula.replace(arithmetic, answer)
         return formula
 
     def _should_minify(self, formula: str) -> bool:
@@ -4041,14 +4163,14 @@ N\(\s*"(?P<key>@[A-Za-z]+)"\s*\)
 _physical_damage_regex = r"""
 MAX\(\s*
   (?P<physical_line_1>
-    \(\s*
-      \(\s*
-        \(\s*
+    (?P<attack_bracket_1>\()\s*
+      (?P<attack_bracket_2>\()\s*
+        (?P<attack_bracket_3>\()\s*
           (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
           (?P<attack_first_value>(?:\+[0-9]+)*)
         \s*\)
         (?:
-          \*\(\s*1(?P<attack_first_ratio>(?:
+          \*(?P<attack_first_ratio_bracket>\()\s*1(?P<attack_first_ratio>(?:
             [+*/][0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
           )*)\s*\)
           |
@@ -4119,14 +4241,14 @@ MAX\(\s*
 
 _magical_damage_regex = r"""
 (?P<magical_main>
-  \(\s*
-    \(\s*
-      \(\s*
+  (?P<attack_bracket_1>\()\s*
+    (?P<attack_bracket_2>\()\s*
+      (?P<attack_bracket_3>\()\s*
         (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
         (?P<attack_first_value>(?:\+[0-9]+)*)
       \s*\)
       (?:
-        \*\(\s*1(?P<attack_first_ratio>(?:
+        \*(?P<attack_first_ratio_bracket>\()\s*1(?P<attack_first_ratio>(?:
           [+*/][0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
         )*)\s*\)
         |
@@ -4144,7 +4266,7 @@ _magical_damage_regex = r"""
   \(\s*100-
     (?:
       \(\s*
-        \(\s*
+        (?P<resist_bracket>\()\s*
           (?:EnemyResistanceMajor|EnemyResistanceMinor)
           (?:
             -\(\s*(?P<resist_loss_value>
@@ -4187,15 +4309,15 @@ _magical_damage_regex = r"""
 
 _true_damage_regex = r"""
 (?P<true_main>
-  \(\s*
-    \(\s*
-      \(\s*
+  (?P<attack_bracket_1>\()\s*
+    (?P<attack_bracket_2>\()\s*
+      (?P<attack_bracket_3>\()\s*
         N\(\s*"@True"\s*\)\+
         (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
         (?P<attack_first_value>(?:\+[0-9]+)*)
       \s*\)
       (?:
-        \*\(\s*1(?P<attack_first_ratio>(?:
+        \*(?P<attack_first_ratio_bracket>\()\s*1(?P<attack_first_ratio>(?:
           [+*/][0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
         )*)\s*\)
         |
@@ -4223,14 +4345,14 @@ _true_damage_regex = r"""
 
 _elemental_damage_regex = r"""
 (?P<elemental_main>
-  \(\s*
-    \(\s*
-      \(\s*
+  (?P<attack_bracket_1>\()\s*
+    (?P<attack_bracket_2>\()\s*
+      (?P<attack_bracket_3>\()\s*
         (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
         (?P<attack_first_value>(?:\+[0-9]+)*)
       \s*\)
       (?:
-        \*\(\s*1(?P<attack_first_ratio>(?:
+        \*(?P<attack_first_ratio_bracket>\()\s*1(?P<attack_first_ratio>(?:
           [+*/][0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
         )*)\s*\)
         |
@@ -4262,7 +4384,7 @@ _elemental_damage_regex = r"""
 
 _default_elemental_damage_regex = r"""
 (?P<default_elemental_main>
-  \(\s*
+  (?P<attack_bracket>\(\s*)
     (?:
       (?P<default_dark>800)
       |
@@ -4291,15 +4413,15 @@ _default_elemental_damage_regex = r"""
 
 _direct_injury_regex = r"""
 (?P<injury_main>
-  \(\s*
-    \(\s*
-      \(\s*
+  (?P<attack_bracket_1>\()\s*
+    (?P<attack_bracket_2>\()\s*
+      (?P<attack_bracket_3>\()\s*
         N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
         (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
         (?P<attack_first_value>(?:\+[0-9]+)*)
       \s*\)
       (?:
-        \*\(\s*1(?P<attack_first_ratio>(?:
+        \*(?P<attack_first_ratio_bracket>\()\s*1(?P<attack_first_ratio>(?:
           [+*/][0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
         )*)\s*\)
         |
@@ -4335,15 +4457,15 @@ _direct_injury_regex = r"""
 _physical_injury_regex = r"""
 MAX\(\s*
   (?P<physical_line_1>
-    \(\s*
-      \(\s*
-        \(\s*
+    (?P<attack_bracket_1>\()\s*
+      (?P<attack_bracket_2>\()\s*
+        (?P<attack_bracket_3>\()\s*
           N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
           (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
           (?P<attack_first_value>(?:\+[0-9]+)*)
         \s*\)
         (?:
-          \*\(\s*1(?P<attack_first_ratio>(?:
+          \*(?P<attack_first_ratio_bracket>\()\s*1(?P<attack_first_ratio>(?:
             [+*/][0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
           )*)\s*\)
           |
@@ -4436,15 +4558,15 @@ MAX\(\s*
 
 _magical_injury_regex = r"""
 (?P<injury_main>
-  \(\s*
-    \(\s*
-      \(\s*
+  (?P<attack_bracket_1>\()\s*
+    (?P<attack_bracket_2>\()\s*
+      (?P<attack_bracket_3>\()\s*
         N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
         (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
         (?P<attack_first_value>(?:\+[0-9]+)*)
       \s*\)
       (?:
-        \*\(\s*1(?P<attack_first_ratio>(?:
+        \*(?P<attack_first_ratio_bracket>\()\s*1(?P<attack_first_ratio>(?:
           [+*/][0-9.]+|\+\(\s*N\(\s*"@[A-Za-z]+"\s*\)\+[0-9.]+\s*\)
         )*)\s*\)
         |
@@ -4463,7 +4585,7 @@ _magical_injury_regex = r"""
     \(\s*100-
       (?:
         \(\s*
-          \(\s*
+          (?P<resist_bracket>\()\s*
             (?:EnemyResistanceMajor|EnemyResistanceMinor)
             (?:
               -\(\s*(?P<resist_loss_value>[0-9.]+(?:\+[0-9.]+)*)\s*\)
