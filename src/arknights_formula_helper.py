@@ -91,13 +91,8 @@ def parse_args() -> argparse.Namespace:
         args.generation_target = GenerationTarget.EXCEL
     elif args.target == "javascript":
         Assert.true(
-            (
-                args.from_type == "damage" and
-                args.to_type == "buff" and
-                (args.minify is None or args.minify == "off")
-            ),
-            "--target=javascript is currently only available for "
-            "--from=damage --to=buff --minify=off"
+            args.from_type == "damage" and args.to_type == "buff",
+            "--target=javascript is currently only available for --from=damage --to=buff"
         )
         args.generation_target = GenerationTarget.JAVASCRIPT
     else:
@@ -110,22 +105,17 @@ def parse_args() -> argparse.Namespace:
         not args.dry_run or args.file,
         "--dry-run must be used together with --file"
     )
-    if args.target == "excel":
-        if args.file:
+    if args.file:
+        args.minify_policy = MinifyPolicy.MAX
+    else:
+        if args.minify is None or args.minify == "auto":
+            args.minify_policy = MinifyPolicy.ON_DEMAND
+        elif args.minify == "off":
+            args.minify_policy = MinifyPolicy.NO_MINIFY
+        elif args.minify == "max":
             args.minify_policy = MinifyPolicy.MAX
         else:
-            if args.minify is None or args.minify == "auto":
-                args.minify_policy = MinifyPolicy.ON_DEMAND
-            elif args.minify == "off":
-                args.minify_policy = MinifyPolicy.NO_MINIFY
-            elif args.minify == "max":
-                args.minify_policy = MinifyPolicy.MAX
-            else:
-                Assert.never()
-    elif args.target == "javascript":
-        args.minify_policy = MinifyPolicy.NO_MINIFY
-    else:
-        Assert.never()
+            Assert.never()
     return args
 
 
@@ -280,7 +270,7 @@ class Engine:
         ])
         if generation_target == GenerationTarget.EXCEL:
             transformers.extend([
-                Minifier(generation_target, minify_policy)
+                Minifier(generation_target, minify_policy),
             ])
         elif generation_target == GenerationTarget.JAVASCRIPT:
             transformers.extend(
@@ -289,6 +279,7 @@ class Engine:
             transformers.extend([
                 LetBindingTranslator(generation_target),
                 MultiLineStringTranslator(generation_target),
+                Minifier(generation_target, minify_policy),
                 EqualSignTranslator(generation_target),
             ])
             transformers.extend(
@@ -1366,6 +1357,7 @@ class AnnotationValidator(Visitor):
                 "@MonoEnemyStolenDefense", "@MonoEnemyFrozenResistance",
                 "@MonoEnemyVulnerable", "@MonoEnemyVulnerablePhysical",
                 "@MonoEnemyVulnerableMagical", "@MonoEnemyVulnerableElemental",
+                "@MonoAbundantMagical",
                 "@MonoSkillPointAutomatic",
                 "@True", "@InjurySanity", "@InjuryFire", "@InjuryDark",
                 "@SkillOffensiveAttackCount", "@AttackSpeed", "@SkillAutomatic",
@@ -1424,6 +1416,11 @@ class RegexValidator(Visitor):
             ])
             if keyword_count != regex_count:
                 assert_fail(keyword, keyword_count, regex_count)
+        def expect_sub_occur(parent: str, child: str) -> None:
+            parent_count = count(parent)
+            child_count = count(child)
+            if parent_count > child_count:
+                assert_fail(child, parent_count, child_count)
         expect_occur(r'BaseAttack', [_operator_id_regex])
         expect_occur(r'BaseSummonAttack', [_summon_id_regex])
         expect_multi_occur(r'(?<!0\*)(BaseAttack|BaseSummonAttack)', [
@@ -1440,15 +1437,15 @@ class RegexValidator(Visitor):
             _physical_damage_regex,
             _physical_injury_regex,
         ])
-        expect_occur(r'EnemyResistanceMajor(?!>=)|(?<!>=)EnemyResistanceMinor', [
+        expect_occur(r'EnemyResistanceMajor(?!=|>|<)|(?<!=|>|<)EnemyResistanceMinor', [
             _magical_damage_regex,
             _magical_injury_regex,
         ])
-        expect_occur(r'EnemyElementalResistanceMajor|EnemyElementalResistanceMinor', [
+        expect_occur(r'EnemyElementalResistanceMajor(?!=|>|<)|(?<!=|>|<)EnemyElementalResistanceMinor', [
             _default_elemental_damage_regex,
             _elemental_damage_regex,
         ])
-        expect_occur(r'(EnemyInjuryResistanceMajor|EnemyInjuryResistanceMinor)(?!>0)', [
+        expect_occur(r'(EnemyInjuryResistanceMajor(?!=|>|<)|(?<!=|>|<)EnemyInjuryResistanceMinor)(?!>0)', [
             _direct_injury_regex,
             _physical_injury_regex,
             _magical_injury_regex,
@@ -1463,6 +1460,7 @@ class RegexValidator(Visitor):
         expect_occur(r'"@SkillAutomatic"', [_skill_automatic_regex])
         expect_occur(r'"@SkillOffensiveAttackCount"', [_skill_offensive_attack_count_regex])
         expect_occur(r'"@SkillOffensive"', [_skill_offensive_regex])
+        expect_sub_occur(r'\bTargetIncludeMinor\b', r'\bEnemyCountMinor\b')
 
 
 class Transformer:
@@ -1856,6 +1854,7 @@ class DamageBuffInjector(BuffInjector):
             mono_buffs = {
                 "@MonoEnemyVulnerable": "BuffDamageMonoEnemyVulnerableFinalRatio",
                 "@MonoEnemyVulnerableMagical": "BuffDamageMonoEnemyVulnerableMagicalFinalRatio",
+                "@MonoAbundantMagical": "BuffDamageMonoAbundantMagicalFinalRatio",
             }
         elif damage_type == "true":
             buff = '*BuffDamageTrueFinalRatio'
@@ -3753,7 +3752,7 @@ class EqualSignTranslator(WholeTransformer):
 
 class Poker(Transformer):
     def __init__(self, poke_literal: str):
-        self._poke_literal = poke_literal
+        self._poke_literal = self._standardize(poke_literal)
         super().__init__()
 
     @Assert.override(Transformer)
@@ -3767,9 +3766,12 @@ class Poker(Transformer):
         ]
 
     def _poke(self, context: MatchContext) -> None:
-        if context.get_all() != self._poke_literal:
+        if self._standardize(context.get_all()) != self._poke_literal:
             start, end = context.match.start(), context.match.end()
             context.replace_by_index("0", start, end, allow_shorten=True)
+
+    def _standardize(self, text: str) -> str:
+        return re.sub(r"\s", "", text)
 
 
 class PhysicalDamagePoker(Poker):
@@ -3835,10 +3837,6 @@ class PrePokerSubjectInjector(WholeTransformer):
 
 class Minifier(WholeTransformer):
     def __init__(self, generation_target: GenerationTarget, minify_policy: MinifyPolicy):
-        Assert.true(
-            generation_target == GenerationTarget.EXCEL,
-            "Currently only Excel target code can be minified"
-        )
         self._max_legal_length = 8192
         self._generation_target = generation_target
         self._minify_policy = minify_policy
@@ -3871,19 +3869,31 @@ class Minifier(WholeTransformer):
     def _minify_all(self, formula: str) -> str:
         if not self._should_minify(formula):
             return formula
-        minifiers = [
-            self._minify_variables,
-            self._minify_annotations,
-            self._minify_whitespaces,
-            self._minify_idempotence,
-            self._minify_arithmetics,
-            self._minify_idempotence,
-        ]
-        for minify in minifiers:
+        for minify in self._get_minifiers():
             formula = minify(formula)
             if not self._should_minify(formula):
                 return formula
         return formula
+
+    def _get_minifiers(self) -> Iterable[Callable[[str], str]]:
+        if self._generation_target == GenerationTarget.EXCEL:
+            return [
+                self._minify_variables,
+                self._minify_annotations,
+                self._minify_whitespaces,
+                self._minify_idempotence,
+                self._minify_arithmetics,
+                self._minify_idempotence,
+            ]
+        elif self._generation_target == GenerationTarget.JAVASCRIPT:
+            return [
+                self._minify_annotations,
+                self._minify_idempotence,
+                self._minify_arithmetics,
+                self._minify_idempotence,
+            ]
+        else:
+            Assert.never()
 
     def _minify_variables(self, formula: str) -> str:
         for original, short in self._variable_map.items():
@@ -3893,31 +3903,53 @@ class Minifier(WholeTransformer):
         return formula
 
     def _minify_annotations(self, formula: str) -> str:
-        return re.sub(pattern=r'N\("[^"]+?"\)', repl="0", string=formula)
+        formula = re.sub(pattern=r'N\("[^"]+?"\)', repl="0", string=formula)
+        formula = re.sub(pattern=r'N\(`[^`]+?`\)', repl="0", string=formula)
+        return formula
 
     def _minify_whitespaces(self, formula: str) -> str:
         return re.sub(pattern=r"\s", repl="", string=formula)
 
     def _minify_idempotence(self, formula: str) -> str:
         formula = formula.replace("(0+", "(").replace("(1*", "(")
-        formula = re.sub(pattern=r"\bMAX\(([a-z]+)\)", repl=r"\1", string=formula)
-        formula = re.sub(pattern=r"(?<=[+\-*/(])\(([a-z]+)\)", repl=r"\1", string=formula)
+        formula = re.sub(pattern=r"\bMAX\(([a-zA-Z]+)\)", repl=r"\1", string=formula)
+        formula = re.sub(pattern=r"(?<=[+\-*/(])\(([a-zA-Z]+)\)", repl=r"\1", string=formula)
         return formula
 
     def _minify_arithmetics(self, formula: str) -> str:
-        pattern = r'\(([\d.]+)\+([\d.]+)([+)])'
+        plus_pattern = r'(\()([\d.]+)\+([\d.]+)([+)])'
+        multiply_pattern = r'(\)\*)([\d.]+)\*([\d.]+)([*)])'
+        inner_multiply_pattern = r'([(+])([\d.]+)\*([\d.]+)([+)])'
+        formula = self._run_arithmetics_pattern(formula, inner_multiply_pattern, "*")
+        formula = self._run_arithmetics_pattern(formula, multiply_pattern, "*")
+        formula = self._run_arithmetics_pattern(formula, plus_pattern, "+")
+        return formula
+
+    def _run_arithmetics_pattern(self, formula: str, pattern: str, operator: Literal["+", "*"]):
         while True:
             answer_map = {}
             for match in re.finditer(pattern, formula):
                 unit = match.group()
-                lhs = match.group(1)
-                rhs = match.group(2)
-                close = match.group(3)
+                begin = match.group(1)
+                lhs = match.group(2)
+                rhs = match.group(3)
+                end = match.group(4)
                 convert = float if ('.' in lhs) or ('.' in rhs) else int
                 lhs_precision = len(lhs.split('.')[1]) if '.' in lhs else 0
                 rhs_precision = len(rhs.split('.')[1]) if '.' in rhs else 0
-                answer = round(convert(lhs) + convert(rhs), max(lhs_precision, rhs_precision))
-                answer_map[unit] = f'({answer}{close}'
+                if operator == "+":
+                    raw_answer = convert(lhs) + convert(rhs)
+                    precision = max(lhs_precision, rhs_precision)
+                elif operator == "*":
+                    raw_answer = convert(lhs) * convert(rhs)
+                    precision = lhs_precision + rhs_precision
+                else:
+                    Assert.never()
+                answer = round(raw_answer, precision)
+                int_answer = round(answer)
+                if abs(answer - int_answer) < 1e-5:
+                    answer = int_answer
+                answer_map[unit] = f'{begin}{answer}{end}'
             if len(answer_map) == 0:
                 break
             for arithmetic, answer in answer_map.items():
@@ -3999,10 +4031,11 @@ class Minifier(WholeTransformer):
         "BuffDamageMonoEnemyVulnerableElementalFinalRatioSanity": "zbj",
         "BuffDamageMonoEnemyVulnerableElementalFinalRatioFire": "zbf",
         "BuffDamageMonoEnemyVulnerableElementalFinalRatioDark": "zbg",
+        "BuffDamageMonoAbundantMagicalFinalRatio": "zbq",
         "BuffDamageMonoSkillPointValueAutomatic": "zbc",
         "BuffDamageMonoSkillPointValueAutomaticCaster": "zbd",
         "BuffDamageMonoSkillPointValueAutomaticSupporter": "zbe",
-        # last variable abbreviation: zbp
+        # last variable abbreviation: zbq
 
         "EnemyDefenseMajor": "zua",
         "EnemyDefenseMinor": "zub",
@@ -4107,12 +4140,15 @@ class JavaScriptTarget:
         "BuffDamageMonoEnemyVulnerableElementalFinalRatioSanity": "controlBuffDamageMonoEnemyVulnerableElementalFinalRatioSanity",
         "BuffDamageMonoEnemyVulnerableElementalFinalRatioFire": "controlBuffDamageMonoEnemyVulnerableElementalFinalRatioFire",
         "BuffDamageMonoEnemyVulnerableElementalFinalRatioDark": "controlBuffDamageMonoEnemyVulnerableElementalFinalRatioDark",
+        "BuffDamageMonoAbundantMagicalFinalRatio": "controlBuffDamageMonoAbundantMagicalFinalRatio",
         "BuffDamageMonoSkillPointValueAutomatic": "controlBuffDamageMonoSkillPointValueAutomatic",
         "BuffDamageMonoSkillPointValueAutomaticCaster": "controlBuffDamageMonoSkillPointValueAutomaticCaster",
         "BuffDamageMonoSkillPointValueAutomaticSupporter": "controlBuffDamageMonoSkillPointValueAutomaticSupporter",
         "LiteralEnemyRankNormal": "controlLiteralEnemyRankNormalValue",
         "LiteralEnemyRankElite": "controlLiteralEnemyRankEliteValue",
         "LiteralEnemyRankLeader": "controlLiteralEnemyRankLeaderValue",
+        "TargetIncludeMajor": "controlTargetIncludeMajor",
+        "TargetIncludeMinor": "controlTargetIncludeMinor",
 
         "BuffDamageSkillPointSupplyEnablesAutomatic": "controlBuffDamageSkillPointSupplyEnablesAutomatic",
         "BuffDamageSkillPointSupplyEnablesOffensive": "controlBuffDamageSkillPointSupplyEnablesOffensive",
