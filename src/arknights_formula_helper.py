@@ -967,6 +967,7 @@ class PlainPosition(Enum):
 class OperatorElementalType(Enum):
     NONE = "None"
     SANITY = "Sanity"
+    WATER = "Water"
     FIRE = "Fire"
     DARK = "Dark"
 
@@ -1025,6 +1026,7 @@ class OperatorInfo:
         elemental_type_map = {
             "": OperatorElementalType.NONE,
             "神经": OperatorElementalType.SANITY,
+            "侵蚀": OperatorElementalType.WATER,
             "灼燃": OperatorElementalType.FIRE,
             "凋亡": OperatorElementalType.DARK,
         }
@@ -1173,6 +1175,9 @@ class Operator(DeployableUnit):
     def deal_elemental_sanity(self) -> bool:
         return Operator._info[self._id].elemental_type == OperatorElementalType.SANITY
 
+    def deal_elemental_water(self) -> bool:
+        return Operator._info[self._id].elemental_type == OperatorElementalType.WATER
+
     def deal_elemental_fire(self) -> bool:
         return Operator._info[self._id].elemental_type == OperatorElementalType.FIRE
 
@@ -1283,6 +1288,7 @@ class OperatorElementalDamageValidator(Visitor):
         matches = re.finditer(id_pattern, formula)
         allow_elemental = False
         allow_elemental_dark = False
+        allow_elemental_water = False
         allow_elemental_fire = False
         allow_elemental_sanity = False
         operator_names = set()
@@ -1294,6 +1300,8 @@ class OperatorElementalDamageValidator(Visitor):
                 allow_elemental = True
                 if operator.deal_elemental_dark():
                     allow_elemental_dark = True
+                if operator.deal_elemental_water():
+                    allow_elemental_water = True
                 if operator.deal_elemental_fire():
                     allow_elemental_fire = True
                 if operator.deal_elemental_sanity():
@@ -1322,11 +1330,17 @@ class OperatorElementalDamageValidator(Visitor):
             for pattern in patterns:
                 for match in re.finditer(pattern, formula):
                     injury_type = match.group("injury_type")
-                    if injury_type == "@InjuryDark":
+                    if injury_type == "@InjurySanity":
                         Assert.true(
-                            allow_elemental_dark,
+                            allow_elemental_sanity,
                             f"Illegal injury type: {", ".join(operator_names)} "
-                            f"is not expected to deal dark injury"
+                            f"is not expected to deal sanity injury"
+                        )
+                    elif injury_type == "@InjuryWater":
+                        Assert.true(
+                            allow_elemental_water,
+                            f"Illegal injury type: {", ".join(operator_names)} "
+                            f"is not expected to deal water injury"
                         )
                     elif injury_type == "@InjuryFire":
                         Assert.true(
@@ -1334,11 +1348,11 @@ class OperatorElementalDamageValidator(Visitor):
                             f"Illegal injury type: {", ".join(operator_names)} "
                             f"is not expected to deal fire injury"
                         )
-                    elif injury_type == "@InjurySanity":
+                    elif injury_type == "@InjuryDark":
                         Assert.true(
-                            allow_elemental_sanity,
+                            allow_elemental_dark,
                             f"Illegal injury type: {", ".join(operator_names)} "
-                            f"is not expected to deal sanity injury"
+                            f"is not expected to deal dark injury"
                         )
                     else:
                         Assert.never()
@@ -1359,7 +1373,7 @@ class AnnotationValidator(Visitor):
                 "@MonoEnemyVulnerableMagical", "@MonoEnemyVulnerableElemental",
                 "@MonoAbundantMagical",
                 "@MonoSkillPointAutomatic",
-                "@True", "@InjurySanity", "@InjuryFire", "@InjuryDark",
+                "@True", "@InjurySanity", "@InjuryWater", "@InjuryFire", "@InjuryDark",
                 "@SkillOffensiveAttackCount", "@AttackSpeed", "@SkillAutomatic",
                 "@SkillOffensive", "@NoBuff",
             ])
@@ -1450,7 +1464,7 @@ class RegexValidator(Visitor):
             _physical_injury_regex,
             _magical_injury_regex,
         ])
-        expect_multi_occur(r'"@InjuryDark"|"@InjuryFire"|"@InjurySanity"', [
+        expect_multi_occur(r'"@InjurySanity"|"@InjuryWater"|"@InjuryFire"|"@InjuryDark"', [
             (_direct_injury_regex, 1),
             (_physical_injury_regex, 2),
             (_magical_injury_regex, 1),
@@ -1562,23 +1576,29 @@ class Transformer:
         )
         has_elemental = False
         sanity = False
+        water = False
         fire = False
         dark = False
         for operator in operators:
             if operator.deal_elemental():
                 has_elemental = True
             if operator.deal_elemental_sanity():
-                Assert.true((not fire) and (not dark), error_message)
+                Assert.true((not water) and (not fire) and (not dark), error_message)
                 sanity = True
+            elif operator.deal_elemental_water():
+                Assert.true((not sanity) and (not fire) and (not dark), error_message)
+                water = True
             elif operator.deal_elemental_fire():
-                Assert.true((not sanity) and (not dark), error_message)
+                Assert.true((not sanity) and (not water) and (not dark), error_message)
                 fire = True
             elif operator.deal_elemental_dark():
-                Assert.true((not sanity) and (not fire), error_message)
+                Assert.true((not sanity) and (not water) and (not fire), error_message)
                 dark = True
         if has_elemental:
             if sanity:
                 return OperatorElementalType.SANITY
+            elif water:
+                return OperatorElementalType.WATER
             elif fire:
                 return OperatorElementalType.FIRE
             elif dark:
@@ -1876,6 +1896,8 @@ class DamageBuffInjector(BuffInjector):
             mono_buff = "BuffDamageMonoEnemyVulnerableElementalFinalRatio"
             if elemental_type == OperatorElementalType.SANITY:
                 mono_buff += ",BuffDamageMonoEnemyVulnerableElementalFinalRatioSanity"
+            elif elemental_type == OperatorElementalType.WATER:
+                pass
             elif elemental_type == OperatorElementalType.FIRE:
                 mono_buff += ",BuffDamageMonoEnemyVulnerableElementalFinalRatioFire"
             elif elemental_type == OperatorElementalType.DARK:
@@ -2181,12 +2203,14 @@ class DefaultElementalDamageBuffInjector(DamageBuffInjector):
         groups = match.groupdict()
         Assert.has_key(groups, [
             "default_elemental_main", "attack_bracket",
-            "default_sanity", "default_fire", "default_dark",
+            "default_sanity", "default_water", "default_fire", "default_dark",
             "attack_gain", "damage_final_ratio", "damage_final_ratio_empty",
         ])
         Assert.not_none(groups, ["attack_gain"])
         Assert.not_empty(groups, ["default_elemental_main", "attack_bracket"])
-        Assert.either(groups, ["default_sanity", "default_fire", "default_dark"])
+        Assert.either(groups, [
+            "default_sanity", "default_water", "default_fire", "default_dark",
+        ])
         Assert.either(groups, ["damage_final_ratio", "damage_final_ratio_empty"])
 
 
@@ -2197,6 +2221,7 @@ class InjuryBuffInjector(DamageBuffInjector):
     def _inject_injury_final_ratio(self, context: MatchContext) -> None:
         injury_buffs = {
             '@InjurySanity': '*BuffDamageInjuryFinalRatio*BuffDamageInjurySanityFinalRatio',
+            '@InjuryWater': '*BuffDamageInjuryFinalRatio*BuffDamageInjuryWaterFinalRatio',
             '@InjuryFire': '*BuffDamageInjuryFinalRatio*BuffDamageInjuryFireFinalRatio',
             '@InjuryDark': '*BuffDamageInjuryFinalRatio*BuffDamageInjuryDarkFinalRatio',
         }
@@ -3995,6 +4020,7 @@ class Minifier(WholeTransformer):
         "BuffDamageElementalFinalRatio": "zx",
         "BuffDamageInjuryFinalRatio": "zy",
         "BuffDamageInjurySanityFinalRatio": "zbi",
+        "BuffDamageInjuryWaterFinalRatio": "zbr",
         "BuffDamageInjuryFireFinalRatio": "zz",
         "BuffDamageInjuryDarkFinalRatio": "zaa",
         "BuffDamageSkillPointValueAutomatic": "zab",
@@ -4035,7 +4061,7 @@ class Minifier(WholeTransformer):
         "BuffDamageMonoSkillPointValueAutomatic": "zbc",
         "BuffDamageMonoSkillPointValueAutomaticCaster": "zbd",
         "BuffDamageMonoSkillPointValueAutomaticSupporter": "zbe",
-        # last variable abbreviation: zbq
+        # last variable abbreviation: zbr
 
         "EnemyDefenseMajor": "zua",
         "EnemyDefenseMinor": "zub",
@@ -4059,6 +4085,7 @@ class Minifier(WholeTransformer):
         "BaseAttackRE03D": "zxb",
         "BaseAttackLN11D": "zxc",
         # "BaseAttackNM06": "zxd",  # name removed
+        "BaseAttackRB19X": "zxe",
     }
 
     _auto_variables = ()
@@ -4117,6 +4144,7 @@ class JavaScriptTarget:
         "BuffDamageElementalFinalRatio": "controlBuffDamageElementalFinalRatio",
         "BuffDamageInjuryFinalRatio": "controlBuffDamageInjuryFinalRatio",
         "BuffDamageInjurySanityFinalRatio": "controlBuffDamageInjurySanityFinalRatio",
+        "BuffDamageInjuryWaterFinalRatio": "controlBuffDamageInjuryWaterFinalRatio",
         "BuffDamageInjuryFireFinalRatio": "controlBuffDamageInjuryFireFinalRatio",
         "BuffDamageInjuryDarkFinalRatio": "controlBuffDamageInjuryDarkFinalRatio",
         "BuffDamageSkillPointValueAutomatic": "controlBuffDamageSkillPointValueAutomatic",
@@ -4427,6 +4455,8 @@ _default_elemental_damage_regex = r"""
       (?P<default_fire>7000)
       |
       (?P<default_sanity>6000)
+      |
+      (?P<default_water>5000)
     )
     (?P<attack_gain>)
   \s*\)
@@ -4452,7 +4482,7 @@ _direct_injury_regex = r"""
   (?P<attack_bracket_1>\()\s*
     (?P<attack_bracket_2>\()\s*
       (?P<attack_bracket_3>\()\s*
-        N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
+        N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity|InjuryWater))"\s*\)\+
         (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
         (?P<attack_first_value>(?:\+[0-9]+)*)
       \s*\)
@@ -4496,7 +4526,7 @@ MAX\(\s*
     (?P<attack_bracket_1>\()\s*
       (?P<attack_bracket_2>\()\s*
         (?P<attack_bracket_3>\()\s*
-          N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
+          N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity|InjuryWater))"\s*\)\+
           (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
           (?P<attack_first_value>(?:\+[0-9]+)*)
         \s*\)
@@ -4519,7 +4549,7 @@ MAX\(\s*
     \(\s*
       \(\s*
         \(\s*
-          N\(\s*"(?:@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
+          N\(\s*"(?:@(?:InjuryDark|InjuryFire|InjurySanity|InjuryWater))"\s*\)\+
           (?:BaseAttack|BaseSummonAttack)[a-zA-Z0-9]+
           (?:\+[0-9]+)*
         \s*\)
@@ -4597,7 +4627,7 @@ _magical_injury_regex = r"""
   (?P<attack_bracket_1>\()\s*
     (?P<attack_bracket_2>\()\s*
       (?P<attack_bracket_3>\()\s*
-        N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity))"\s*\)\+
+        N\(\s*"(?P<injury_type>@(?:InjuryDark|InjuryFire|InjurySanity|InjuryWater))"\s*\)\+
         (?:BaseAttack|BaseSummonAttack)(?P<id>[a-zA-Z0-9]+)
         (?P<attack_first_value>(?:\+[0-9]+)*)
       \s*\)

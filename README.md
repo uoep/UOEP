@@ -5,7 +5,7 @@
 UOEP是一个可广泛用于明日方舟干员、随着游戏更新不断发展、涵盖各种环境和干员各项能力、一键自动计算干员强度的评价体系。
 
 ### 最新消息
-- UOEP当前版本: v0.15.0，[去下载数据表](releases/latest.md)
+- UOEP当前版本: v0.16.0，[去下载数据表](releases/latest.md)
 - 网页版DPS计算器已发布，<a href="https://ark-dps.com">去体验 <img src="resources/arkdps.svg" alt="ArkDPS Logo" width="16" height="16"> ArkDPS</a>
 
 ### 了解更多
